@@ -53,7 +53,10 @@ fn update_single_sub(
     // 1. Загрузка подписки
     let raw_path = format!("/tmp/vpn-sub-{}-raw.txt", sub.id);
     if sub.url.starts_with("http://") || sub.url.starts_with("https://") {
-        let client = Client::new();
+        let client = Client::builder()
+            .no_proxy()
+            .build()
+            .context("Не удалось создать HTTP-клиент")?;
         let resp = client.get(&sub.url).send()?;
         let bytes = resp.bytes()?;
         fs::write(&raw_path, bytes)?;

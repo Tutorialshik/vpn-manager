@@ -1,8 +1,3 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use config::AppConfig;
-use std::path::PathBuf;
-
 mod config;
 mod commands;
 mod geo;
@@ -11,6 +6,11 @@ mod settings;
 mod subs;
 mod update;
 mod utils;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use config::AppConfig;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "vpn-manager", version, about = "Управление VPN подписками и прокси")]
@@ -23,8 +23,7 @@ struct Cli {
 enum Commands {
     #[command(about = "Запуск прокси")]
     Start {
-        #[arg(required = true)]
-        target: String,
+        target: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -111,18 +110,20 @@ fn main() -> Result<()> {
     let subs_path = config_dir.join("subscriptions.json");
 
     let mut app_config = AppConfig::load_or_default(&config_path)?;
-    let cmd_help = commands::load_commands(&commands_path).ok(); // не критично
+    let cmd_help = commands::load_commands(&commands_path).ok();
 
     match cli.command {
         Some(Commands::Start { target, extra_args }) => {
-            proxy::handle_start(&target, &extra_args, &mut app_config, &config_path, &subs_path)?;
+            match target {
+                Some(t) => proxy::handle_start(&t, &extra_args, &mut app_config, &config_path, &subs_path)?,
+                None => proxy::show_start_help(&app_config, &subs_path),
+            }
         }
         Some(Commands::Stop) => {
             proxy::stop_proxy(&app_config)?;
         }
         Some(Commands::Restart { extra_args }) => {
             proxy::stop_proxy(&app_config)?;
-            // используем last_region из app_config
             proxy::handle_start("now", &extra_args, &mut app_config, &config_path, &subs_path)?;
         }
         Some(Commands::Update { target, protocol, limit, keep_raw }) => {
@@ -151,14 +152,24 @@ fn main() -> Result<()> {
 }
 
 fn status(app: &AppConfig, subs_path: &PathBuf) -> Result<()> {
-    use proxy::is_running;
+    let running = proxy::is_running(app);
+    let (status_text, color) = if running {
+        ("запущен", "\x1b[32m")  // зеленый
+    } else {
+        ("не запущен", "\x1b[31m") // красный
+    };
+    let reset = "\x1b[0m";
+
     println!("═══════════════════ Состояние ═══════════════════");
     println!("  Порт:            {}", app.default_port);
     println!("  Регион:          {}", app.last_region);
     println!("  Режим:           {}", app.last_mode_type);
     println!("  Ядро:            {}", app.core);
-    // ... остальные поля аналогично
-    if is_running(app) {
+    println!("  Ротация:         {} с", app.rotate);
+    println!("  Insecure:        {}", if app.insecure { "вкл" } else { "выкл" });
+    println!("  Speedtest:       {}", if app.speedtest { "вкл" } else { "выкл" });
+    println!("  HTTP verbose:    {}", if app.http_verbose { "вкл" } else { "выкл" });
+    if proxy::is_running(app) {
         println!("  Прокси:          запущен");
     } else {
         println!("  Прокси:          не запущен");
