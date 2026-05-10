@@ -4,10 +4,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use tempfile::NamedTempFile;
 use crate::config::AppConfig;
-use crate::subs::{load_subs, Subscription};
+use crate::subs::Subscription;
 use crate::utils;
 use crate::geo;
 
@@ -19,95 +18,76 @@ pub fn handle_update(
     config: &AppConfig,
     subs_path: &Path,
 ) -> Result<()> {
-    let subs = load_subs(subs_path)?;
-    let enabled_subs: Vec<_> = subs.into_iter().filter(|s| s.enabled).collect();
-
-    if target == "all" {
-        for sub in enabled_subs {
-            update_single_sub(&sub, protocol, limit, keep_raw, config)?;
-        }
-    } else {
-        let ids = utils::expand_ids(target)?;
-        for id in ids {
-            if let Some(sub) = enabled_subs.iter().find(|s| s.id == id) {
-                update_single_sub(sub, protocol, limit, keep_raw, config)?;
-            } else {
-                eprintln!("⚠️ Подписка {} не найдена", id);
-            }
+    let subs = crate::subs::load_subs(subs_path)?;
+    let ids = if target == "all" { subs.iter().map(|s| s.id).collect() } else { utils::expand_ids(target)? };
+    for id in ids {
+        if let Some(sub) = subs.iter().find(|s| s.id == id) {
+            update_single_sub(sub, protocol, limit, keep_raw, false, config)?;
+        } else {
+            eprintln!("⚠️ Подписка {} не найдена", id);
         }
     }
     Ok(())
 }
 
-fn update_single_sub(
+pub fn update_single_sub(
     sub: &Subscription,
     proto: &str,
     limit: usize,
     keep_raw: bool,
+    show_info: bool,
     config: &AppConfig,
 ) -> Result<()> {
     println!("ℹ️ Обновление [{}] {}", sub.id, sub.name);
     let config_dir = dirs::config_dir().unwrap().join("vpn-manager");
     std::fs::create_dir_all(&config_dir)?;
 
-    // 1. Загрузка подписки
+    // 1. Загрузка
     let raw_path = format!("/tmp/vpn-sub-{}-raw.txt", sub.id);
     if sub.url.starts_with("http://") || sub.url.starts_with("https://") {
-        let client = Client::builder()
-            .no_proxy()
-            .build()
-            .context("Не удалось создать HTTP-клиент")?;
+        let client = Client::builder().no_proxy().build()?;
         let resp = client.get(&sub.url).send()?;
         let bytes = resp.bytes()?;
         fs::write(&raw_path, bytes)?;
     } else if sub.url.starts_with("file://") {
-        let file_path = sub.url.trim_start_matches("file://");
-        fs::copy(file_path, &raw_path)?;
+        fs::copy(sub.url.trim_start_matches("file://"), &raw_path)?;
     } else if Path::new(&sub.url).exists() {
         fs::copy(&sub.url, &raw_path)?;
     } else {
         anyhow::bail!("Неизвестный источник: {}", sub.url);
     }
-
-    // 2. Удаление \r
-    let content = fs::read_to_string(&raw_path)?;
-    let content = content.replace('\r', "");
+    let content = fs::read_to_string(&raw_path)?.replace('\r', "");
     fs::write(&raw_path, content)?;
 
-    // 3. Фильтрация
+    // 2. Фильтрация
     let filtered_path = format!("/tmp/vpn-sub-{}-filtered.txt", sub.id);
     utils::filter_subscription_file(&raw_path, &filtered_path, proto, limit)?;
 
-    // 4. HTTP тесты
+    // 3. HTTP тесты
     let active_urls = utils::get_active_urls(config);
-    if active_urls.is_empty() {
-        anyhow::bail!("Нет активных тестовых URL");
-    }
+    if active_urls.is_empty() { anyhow::bail!("Нет активных тестовых URL"); }
 
-    let live_files = run_http_tests(sub.id, &filtered_path, &active_urls, config)?;
-    if live_files.is_empty() {
-        anyhow::bail!("Нет живых конфигов");
-    }
+    let live_files = run_http_tests(sub.id, &filtered_path, &active_urls, config, show_info)?;
+    if live_files.is_empty() { anyhow::bail!("Нет живых конфигов"); }
 
-    // 5. Слияние и сохранение
+    // 4. Слияние и сохранение
     let merged = format!("/tmp/vpn-sub-{}-live-merged.txt", sub.id);
     utils::merge_files(&live_files, &merged)?;
     let dest = config_dir.join(format!("sub_{}_live.txt", sub.id));
     fs::copy(&merged, &dest)?;
-
-    // 6. Timestamp
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     fs::write(config_dir.join(format!("sub_{}_timestamp.txt", sub.id)), ts)?;
 
-    // 7. Общий all_live и классификация
+    // 5. Общий all_live и классификация
     let mut all_live_content = String::new();
     for entry in fs::read_dir(&config_dir)? {
         let entry = entry?;
         let fname = entry.file_name();
         if let Some(name) = fname.to_str() {
             if name.starts_with("sub_") && name.ends_with("_live.txt") {
-                let data = fs::read_to_string(entry.path()).unwrap_or_default();
-                all_live_content.push_str(&data);
+                if let Ok(data) = fs::read_to_string(entry.path()) {
+                    all_live_content.push_str(&data);
+                }
             }
         }
     }
@@ -115,21 +95,17 @@ fn update_single_sub(
     fs::write(&all_live, utils::unique_lines(&all_live_content))?;
     classify_configs(&all_live, config)?;
 
-    // 8. Очистка если не keep_raw
     if !keep_raw {
         let _ = fs::remove_file(&raw_path);
         let _ = fs::remove_file(&filtered_path);
         let _ = fs::remove_file(&merged);
-        for f in &live_files {
-            let _ = fs::remove_file(f);
-        }
+        for f in &live_files { let _ = fs::remove_file(f); }
     }
-
     println!("✅ Подписка [{}] обновлена", sub.id);
     Ok(())
 }
 
-fn run_http_tests(sub_id: usize, config_file: &str, urls: &[String], config: &AppConfig) -> Result<Vec<PathBuf>> {
+fn run_http_tests(sub_id: usize, config_file: &str, urls: &[String], config: &AppConfig, show_info: bool) -> Result<Vec<PathBuf>> {
     let timeout = config.http_test_timeout;
     let threads = config.http_test_threads;
     let insecure = config.insecure;
@@ -143,8 +119,9 @@ fn run_http_tests(sub_id: usize, config_file: &str, urls: &[String], config: &Ap
         let url = url.clone();
         let config_f = config_file.clone();
         let log = log_dir.join(format!("vpn-http-{}-{}.log", sub_id, sanitize_filename(&url)));
-        let live_file = NamedTempFile::new()?.into_temp_path(); // будет существовать до конца
+        let live_file = NamedTempFile::new()?.into_temp_path();
         let live_path = live_file.to_path_buf();
+        let show_info = show_info.clone();
         let handle = std::thread::spawn(move || -> Result<PathBuf> {
             let mut cmd = Command::new("xray-knife");
             cmd.arg("http")
@@ -155,14 +132,22 @@ fn run_http_tests(sub_id: usize, config_file: &str, urls: &[String], config: &Ap
                 .arg("-o").arg(&live_path);
             if insecure { cmd.arg("-e"); }
             if speedtest { cmd.arg("--speedtest"); }
-            let output = cmd.output()?;
-            // записываем логи
-            if let Ok(mut f) = fs::File::create(&log) {
-                f.write_all(&output.stdout).ok();
-                f.write_all(&output.stderr).ok();
+
+            if show_info {
+                // Вывод на экран
+                cmd.stdout(std::process::Stdio::inherit())
+                   .stderr(std::process::Stdio::inherit());
+                let status = cmd.status()?;
+                if !status.success() { anyhow::bail!("xray-knife http завершился с ошибкой"); }
+            } else {
+                let output = cmd.output()?;
+                if let Ok(mut f) = fs::File::create(&log) {
+                    f.write_all(&output.stdout).ok();
+                    f.write_all(&output.stderr).ok();
+                }
             }
+
             if Path::new(&live_path).exists() && fs::metadata(&live_path)?.len() > 0 {
-                // keep tempfile alive by persisting it? We'll move to permanent /tmp location
                 let perm_path = std::path::PathBuf::from(format!("/tmp/vpn-sub-{}-live-{}.txt", sub_id, sanitize_filename(&url)));
                 fs::rename(&live_path, &perm_path)?;
                 Ok(perm_path)
@@ -233,8 +218,6 @@ fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
         let file_path = lists_dir.join(format!("{}.txt", region));
         fs::write(file_path, lines.join("\n") + "\n")?;
     }
-
-    // объединяем eu страны в eu (уже сделано)
     println!("🌍 Классификация завершена: {} обработано, {} пропущено", total - skipped, skipped);
     Ok(())
 }

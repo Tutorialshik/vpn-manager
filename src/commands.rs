@@ -30,7 +30,12 @@ impl GlobalHelp {
     pub fn global_usage(&self) -> String {
         let mut out = format!("{}\n\n", self.description);
         for (cmd, desc) in &self.commands {
-            out.push_str(&format!("  {:12} - {}\n", cmd, desc));
+            if desc.is_empty() {
+                // просто выводим заголовок-разделитель
+                out.push_str(&format!("{}\n", cmd));
+            } else {
+                out.push_str(&format!("  {:12} - {}\n", cmd, desc));
+            }
         }
         out
     }
@@ -40,3 +45,4 @@ pub fn load_commands(path: &Path) -> Result<CommandsHelp> {
     let content = fs::read_to_string(path)?;
     serde_json::from_str(&content).context("Ошибка парсинга commands.json")
 }
+
