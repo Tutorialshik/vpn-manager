@@ -1,0 +1,22 @@
+[package]
+name = "vpn-manager"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.21"
+libc = "0.2"
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "4.0"
+tempfile = "3.3"
+log = "0.4"
+env_logger = "0.10"
+chrono = "0.4"
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = true
