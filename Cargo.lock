@@ -1387,10 +1387,12 @@ name = "vpn-manager"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "dirs",
  "env_logger",
+ "libc",
  "log",
  "reqwest",
  "serde",

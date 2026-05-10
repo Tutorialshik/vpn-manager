@@ -75,14 +75,15 @@ pub fn list_subscriptions(path: &Path, _config: &super::config::AppConfig) {
 pub fn handle_subs(action: Option<super::SubsCmd>, path: &Path, _config: &super::config::AppConfig) -> Result<()> {
     match action {
         None => {
-        list_subscriptions(path, _config),
+            list_subscriptions(path, _config);
+            Ok(())
+        },
         Some(super::SubsCmd::Add) => {
             let mut id_str = String::new();
             print!("ID (пусто = авто): ");
             io::stdout().flush()?;
             io::stdin().read_line(&mut id_str)?;
             let id: usize = if id_str.trim().is_empty() {
-                // авто ID
                 let subs = load_subs(path)?;
                 subs.iter().map(|s| s.id).max().unwrap_or(0) + 1
             } else {
@@ -113,13 +114,11 @@ pub fn handle_subs(action: Option<super::SubsCmd>, path: &Path, _config: &super:
             save_subs(path, &subs)?;
             println!("✅ Подписка добавлена/обновлена");
             Ok(())
-        }
-    }
+        },
         Some(super::SubsCmd::Remove { id }) => {
             let mut subs = load_subs(path)?;
             if let Some(pos) = subs.iter().position(|s| s.id == id) {
                 subs.remove(pos);
-                // перенумерация
                 for (i, s) in subs.iter_mut().enumerate() {
                     s.id = i + 1;
                 }
@@ -129,11 +128,11 @@ pub fn handle_subs(action: Option<super::SubsCmd>, path: &Path, _config: &super:
                 eprintln!("❌ Подписка {} не найдена", id);
             }
             Ok(())
-        }
+        },
         Some(super::SubsCmd::Edit { id }) => {
             let mut subs = load_subs(path)?;
             let sub = subs.iter_mut().find(|s| s.id == id)
-                .context("Подписка не найдена")?;
+                .ok_or_else(|| anyhow::anyhow!("Подписка не найдена"))?;
             println!("Текущие данные: ID={}, Имя={}, URL={}", sub.id, sub.name, sub.url);
             print!("Новое имя (Enter = оставить): ");
             io::stdout().flush()?;
@@ -143,16 +142,15 @@ pub fn handle_subs(action: Option<super::SubsCmd>, path: &Path, _config: &super:
             io::stdout().flush()?;
             let mut url = String::new();
             io::stdin().read_line(&mut url)?;
-
             if !name.trim().is_empty() { sub.name = name.trim().into(); }
             if !url.trim().is_empty() { sub.url = url.trim().into(); }
             save_subs(path, &subs)?;
             println!("✅ Подписка изменена");
             Ok(())
-        }
+        },
         Some(super::SubsCmd::List) => {
             list_subscriptions(path, _config);
             Ok(())
-        }
+        },
     }
 }

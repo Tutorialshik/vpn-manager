@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 use crate::config::AppConfig;
 use crate::subs::{load_subs, Subscription};
 use crate::utils;
+use crate::geo;
 
 pub fn handle_update(
     target: &str,

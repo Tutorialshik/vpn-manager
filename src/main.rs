@@ -1,3 +1,8 @@
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use config::AppConfig;
+use std::path::PathBuf;
+
 mod config;
 mod commands;
 mod geo;
@@ -6,11 +11,6 @@ mod settings;
 mod subs;
 mod update;
 mod utils;
-
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use config::AppConfig;
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "vpn-manager", version, about = "Управление VPN подписками и прокси")]
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
         }
         None => {
             if let Some(help) = cmd_help {
-                println!("{}", help.global_usage());
+                println!("{}", help.global_help.global_usage());
             } else {
                 println!("Не загружены описания команд. Используйте --help");
             }
