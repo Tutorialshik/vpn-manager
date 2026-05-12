@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct CommandsHelp {
     pub update: CommandHelp,
@@ -12,6 +13,7 @@ pub struct CommandsHelp {
     pub global_help: GlobalHelp,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct CommandHelp {
     pub summary: String,
@@ -45,4 +47,3 @@ pub fn load_commands(path: &Path) -> Result<CommandsHelp> {
     let content = fs::read_to_string(path)?;
     serde_json::from_str(&content).context("Ошибка парсинга commands.json")
 }
-

@@ -1,11 +1,13 @@
-use anyhow::{Context, Result};
-use std::io::{self, Write};
-use std::path::Path;
 use crate::config::AppConfig;
+use crate::http_tester::HttpTester;
+use crate::knife;
 use crate::update;
 use crate::utils;
 use crate::SubsCmd;
 use crate::SwitchCmd;
+use anyhow::{bail, Context, Result};
+use std::io::{self, Write};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -19,7 +21,9 @@ pub struct Subscription {
     pub enabled: bool,
 }
 
-fn default_enabled() -> bool { true }
+fn default_enabled() -> bool {
+    true
+}
 
 type Subscriptions = Vec<Subscription>;
 
@@ -28,11 +32,13 @@ pub fn load_subs(path: &Path) -> Result<Subscriptions> {
         let content = fs::read_to_string(path)?;
         let v: serde_json::Value = serde_json::from_str(&content)?;
         if let Some(subs) = v.get("subscriptions").and_then(|s| s.as_array()) {
-            Ok(serde_json::from_value(serde_json::Value::Array(subs.clone()))?)
+            Ok(serde_json::from_value(serde_json::Value::Array(
+                subs.clone(),
+            ))?)
         } else if v.is_array() {
             Ok(serde_json::from_value(v)?)
         } else {
-            anyhow::bail!("Неверный формат subscriptions.json")
+            bail!("Неверный формат subscriptions.json")
         }
     } else {
         Ok(vec![])
@@ -54,7 +60,11 @@ fn shorten_url(url: &str) -> String {
         let trimmed = if path.len() > 30 { &path[..30] } else { path };
         format!("{}/{}", domain, trimmed.trim_start_matches('/'))
     } else {
-        if url.len() <= 55 { url.to_string() } else { format!("{}...{}", &url[..30], &url[url.len()-20..]) }
+        if url.len() <= 55 {
+            url.to_string()
+        } else {
+            format!("{}...{}", &url[..30], &url[url.len() - 20..])
+        }
     }
 }
 
@@ -63,35 +73,69 @@ fn is_https(url: &str) -> bool {
 }
 
 pub fn list_subscriptions(path: &Path, _config: &AppConfig) {
-    if let Ok(subs) = load_subs(path) {
-        if subs.is_empty() {
-            println!("Нет подписок");
+    let subs = match load_subs(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Ошибка загрузки подписок: {e}");
             return;
         }
-        println!("═══════════════════════ Подписки ═══════════════════════");
-        println!("  {:<4} {:<20} {:>2} {:>6} {:>12}  {:<30} {:>12}", 
-                 "ID", "Имя", "TS", "Живых", "Обновлено", "Ссылка", "Автообн.");
-        for sub in subs {
-            let live_path = dirs::config_dir().unwrap().join("vpn-manager").join(format!("sub_{}_live.txt", sub.id));
-            let count = if live_path.exists() {
-                fs::read_to_string(&live_path).map(|s| s.lines().count()).unwrap_or(0)
-            } else { 0 };
-            let ts_path = dirs::config_dir().unwrap().join("vpn-manager").join(format!("sub_{}_timestamp.txt", sub.id));
-            let updated = fs::read_to_string(&ts_path).unwrap_or_else(|_| "—".into());
-            let short_url = shorten_url(&sub.url);
-            let insecure_mark = if is_https(&sub.url) { "🔒" } else { "🔓" };
-            let auto_update = if _config.auto_update_interval > 0 && 
-                (_config.auto_update_ids == "all" || utils::expand_ids(&_config.auto_update_ids).unwrap_or_default().contains(&sub.id)) 
-            { format!("{}м", _config.auto_update_interval) } else { "—".to_string() };
-
-            let color = if !sub.enabled || count == 0 {
-                "\x1b[31m" // тёмно-красный для отключённых/пустых
-            } else {
-                ""
-            };
-            println!("  {}{:<4} {:<20.20} {:<2} {:>6} {:>12}  {:<30.30} {:>12}\x1b[0m",
-                     color, sub.id, sub.name, insecure_mark, count, updated.trim(), short_url, auto_update);
+    };
+    if subs.is_empty() {
+        println!("Нет подписок");
+        return;
+    }
+    let config_dir = match dirs::config_dir() {
+        Some(d) => d.join("vpn-manager"),
+        None => {
+            eprintln!("Не удалось определить конфигурационную директорию");
+            return;
         }
+    };
+    println!("═══════════════════════ Подписки ═══════════════════════");
+    println!(
+        " {:<4} {:<20} {:>2} {:>6} {:>12} {:<30} {:>12}",
+        "ID", "Имя", "TS", "Живых", "Обновлено", "Ссылка", "Автообн."
+    );
+    for sub in subs {
+        let live_path = config_dir.join(format!("sub_{}_live.txt", sub.id));
+        let count = if live_path.exists() {
+            fs::read_to_string(&live_path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let ts_path = config_dir.join(format!("sub_{}_timestamp.txt", sub.id));
+        let updated = fs::read_to_string(&ts_path).unwrap_or_else(|_| "—".into());
+        let short_url = shorten_url(&sub.url);
+        let insecure_mark = if is_https(&sub.url) { "🔒" } else { "🔓" };
+        let auto_update = if _config.auto_update_interval > 0
+            && (_config.auto_update_ids == "all"
+                || utils::expand_ids(&_config.auto_update_ids)
+                    .unwrap_or_default()
+                    .contains(&sub.id))
+        {
+            format!("{}м", _config.auto_update_interval)
+        } else {
+            "—".to_string()
+        };
+
+        let color = if !sub.enabled || count == 0 {
+            "\x1b[31m"
+        } else {
+            ""
+        };
+        println!(
+            " {}{:<4} {:<20.20} {:<2} {:>6} {:>12} {:<30.30} {:>12}\x1b[0m",
+            color,
+            sub.id,
+            sub.name,
+            insecure_mark,
+            count,
+            updated.trim(),
+            short_url,
+            auto_update
+        );
     }
 }
 
@@ -106,17 +150,15 @@ pub fn add_subscription(path: &Path) -> Result<()> {
     io::stdin().read_line(&mut url)?;
     let url = url.trim().to_string();
 
-    // Попытка автоматически получить имя
     let name = if let Ok(resp) = reqwest::blocking::get(&url) {
         if let Ok(body) = resp.text() {
-            // Ищем первую строку вида # Название или что-то похожее
             body.lines()
                 .find(|l| l.starts_with('#') && !l.starts_with("##"))
                 .map(|l| l.trim_start_matches('#').trim().to_string())
                 .or_else(|| {
-                    // Если нет, извлекаем из URL: последний сегмент пути
-                    url::Url::parse(&url).ok()
-                        .and_then(|u| u.path_segments()?.last().map(|s| s.to_string()))
+                    url::Url::parse(&url)
+                        .ok()
+                        .and_then(|u| u.path_segments()?.next_back().map(|s| s.to_string()))
                         .filter(|s| !s.is_empty())
                 })
                 .unwrap_or_else(|| {
@@ -142,7 +184,12 @@ pub fn add_subscription(path: &Path) -> Result<()> {
     };
 
     let mut subs = subs;
-    subs.push(Subscription { id: new_id, name, url, enabled: true });
+    subs.push(Subscription {
+        id: new_id,
+        name,
+        url,
+        enabled: true,
+    });
     subs.sort_by_key(|s| s.id);
     save_subs(path, &subs)?;
     println!("✅ Подписка добавлена");
@@ -151,8 +198,14 @@ pub fn add_subscription(path: &Path) -> Result<()> {
 
 pub fn edit_subscription(path: &Path, id: usize) -> Result<()> {
     let mut subs = load_subs(path)?;
-    let sub = subs.iter_mut().find(|s| s.id == id).context("Подписка не найдена")?;
-    println!("Текущие данные: ID={}, Имя={}, URL={}", sub.id, sub.name, sub.url);
+    let sub = subs
+        .iter_mut()
+        .find(|s| s.id == id)
+        .context("Подписка не найдена")?;
+    println!(
+        "Текущие данные: ID={}, Имя={}, URL={}",
+        sub.id, sub.name, sub.url
+    );
     print!("Новое имя (Enter = оставить): ");
     io::stdout().flush()?;
     let mut name = String::new();
@@ -161,8 +214,12 @@ pub fn edit_subscription(path: &Path, id: usize) -> Result<()> {
     io::stdout().flush()?;
     let mut url = String::new();
     io::stdin().read_line(&mut url)?;
-    if !name.trim().is_empty() { sub.name = name.trim().into(); }
-    if !url.trim().is_empty() { sub.url = url.trim().into(); }
+    if !name.trim().is_empty() {
+        sub.name = name.trim().into();
+    }
+    if !url.trim().is_empty() {
+        sub.url = url.trim().into();
+    }
     save_subs(path, &subs)?;
     println!("✅ Подписка изменена");
     Ok(())
@@ -170,10 +227,23 @@ pub fn edit_subscription(path: &Path, id: usize) -> Result<()> {
 
 pub fn remove_subscriptions(path: &Path, ids_spec: &str) -> Result<()> {
     let mut subs = load_subs(path)?;
-    let ids = if ids_spec == "all" { (1..=subs.len()).collect() } else { utils::expand_ids(ids_spec)? };
+    let ids = if ids_spec == "all" {
+        (1..=subs.len()).collect()
+    } else {
+        utils::expand_ids(ids_spec)?
+    };
     let mut removed = 0;
-    subs.retain(|s| if ids.contains(&s.id) { removed += 1; false } else { true });
-    for (i, s) in subs.iter_mut().enumerate() { s.id = i + 1; }
+    subs.retain(|s| {
+        if ids.contains(&s.id) {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    for (i, s) in subs.iter_mut().enumerate() {
+        s.id = i + 1;
+    }
     save_subs(path, &subs)?;
     println!("✅ Удалено подписок: {}", removed);
     Ok(())
@@ -181,20 +251,50 @@ pub fn remove_subscriptions(path: &Path, ids_spec: &str) -> Result<()> {
 
 pub fn switch_subscriptions(path: &Path, ids_spec: &str, enable: bool) -> Result<()> {
     let mut subs = load_subs(path)?;
-    let ids = if ids_spec == "all" { (1..=subs.len()).collect() } else { utils::expand_ids(ids_spec)? };
-    for sub in subs.iter_mut() { if ids.contains(&sub.id) { sub.enabled = enable; } }
+    let ids = if ids_spec == "all" {
+        (1..=subs.len()).collect()
+    } else {
+        utils::expand_ids(ids_spec)?
+    };
+    for sub in subs.iter_mut() {
+        if ids.contains(&sub.id) {
+            sub.enabled = enable;
+        }
+    }
     save_subs(path, &subs)?;
-    let action = if enable { "включены" } else { "выключены" };
+    let action = if enable {
+        "включены"
+    } else {
+        "выключены"
+    };
     println!("✅ Подписки {}: {}", action, ids_spec);
     Ok(())
 }
 
-pub fn update_subscriptions(target: &str, protocol: &str, limit: usize, keep_raw: bool, show_info: bool, config: &AppConfig, subs_path: &Path) -> Result<()> {
+// ЕДИНСТВЕННАЯ версия update_subscriptions с параметром tester
+#[allow(clippy::too_many_arguments)]
+pub fn update_subscriptions(
+    target: &str,
+    protocol: &str,
+    limit: usize,
+    keep_raw: bool,
+    show_info: bool,
+    config: &AppConfig,
+    subs_path: &Path,
+    db: Option<&rusqlite::Connection>,
+    tester: &dyn HttpTester,
+) -> Result<()> {
     let subs = load_subs(subs_path)?;
-    let ids = if target == "all" { subs.iter().map(|s| s.id).collect() } else { utils::expand_ids(target)? };
+    let ids = if target == "all" {
+        subs.iter().map(|s| s.id).collect()
+    } else {
+        utils::expand_ids(target)?
+    };
     for id in ids {
         if let Some(sub) = subs.iter().find(|s| s.id == id) {
-            update::update_single_sub(sub, protocol, limit, keep_raw, show_info, config)?;
+            update::update_single_sub(
+                sub, protocol, limit, keep_raw, show_info, config, db, tester,
+            )?;
         } else {
             eprintln!("⚠️ Подписка {} не найдена", id);
         }
@@ -202,7 +302,13 @@ pub fn update_subscriptions(target: &str, protocol: &str, limit: usize, keep_raw
     Ok(())
 }
 
-pub fn handle_subs_ext(action: Option<SubsCmd>, subs_path: &Path, config: &AppConfig) -> Result<()> {
+pub fn handle_subs_ext(
+    action: Option<SubsCmd>,
+    subs_path: &Path,
+    config: &AppConfig,
+    db: Option<&rusqlite::Connection>,
+    tester: &dyn HttpTester,
+) -> Result<()> {
     match action.unwrap_or(SubsCmd::List) {
         SubsCmd::List => {
             list_subscriptions(subs_path, config);
@@ -212,9 +318,18 @@ pub fn handle_subs_ext(action: Option<SubsCmd>, subs_path: &Path, config: &AppCo
         SubsCmd::Add => add_subscription(subs_path),
         SubsCmd::Edit { id } => edit_subscription(subs_path, id),
         SubsCmd::Remove { ids } => remove_subscriptions(subs_path, &ids),
-        SubsCmd::Update { target, info, protocol, limit, keep_raw } => {
+        SubsCmd::Update {
+            target,
+            info,
+            protocol,
+            limit,
+            keep_raw,
+            ..
+        } => {
             match target {
-                Some(t) => update_subscriptions(&t, &protocol, limit, keep_raw, info, config, subs_path)?,
+                Some(t) => update_subscriptions(
+                    &t, &protocol, limit, keep_raw, info, config, subs_path, db, tester,
+                )?,
                 None => {
                     list_subscriptions(subs_path, config);
                     print_subs_help();
@@ -227,30 +342,86 @@ pub fn handle_subs_ext(action: Option<SubsCmd>, subs_path: &Path, config: &AppCo
             SwitchCmd::Off { ids } => switch_subscriptions(subs_path, &ids, false),
         },
         SubsCmd::Cfscanner { sub_id, args } => {
+            let config_dir = dirs::config_dir()
+                .context("Не удалось определить config директорию")?
+                .join("vpn-manager");
             let mut full_args = vec![];
             if let Some(sid) = sub_id {
-                let config_dir = dirs::config_dir().unwrap().join("vpn-manager");
                 let proxy_config = config_dir.join(format!("sub_{}_live.txt", sid));
                 if proxy_config.exists() {
                     full_args.push("-C".to_string());
                     full_args.push(proxy_config.to_string_lossy().into());
                 } else {
-                    anyhow::bail!("Нет живых конфигов для подписки {}. Сначала выполните subs update {}", sid, sid);
+                    bail!(
+                        "Нет живых конфигов для подписки {}. Сначала выполните subs update {}",
+                        sid,
+                        sid
+                    );
                 }
             }
             full_args.extend(args);
-            crate::run_xray_knife("cfscanner", &full_args)
+            knife::run_knife("cfscanner", &full_args)
         }
     }
 }
 
 fn print_subs_help() {
     println!("Команды subs:");
-    println!("  list                    показать список (по умолчанию)");
-    println!("  add                     добавить подписку");
-    println!("  edit <ID>               изменить подписку");
-    println!("  remove <IDs>            удалить (all, 1,2-4, 1,3,5)");
-    println!("  update <IDs> [-i] [-p proto] [-l N] [-k on|off]");
-    println!("  switch on/off <IDs>     включить/выключить");
-    println!("  cfscanner [--sub-id ID] [флаги]");
+    println!(" list показать список (по умолчанию)");
+    println!(" add добавить подписку");
+    println!(" edit <ID> изменить подписку");
+    println!(" remove <IDs> удалить (all, 1,2-4, 1,3,5)");
+    println!(" update <IDs> [-i] [-p proto] [-l N] [-k on|off] [-x]");
+    println!(" switch on/off <IDs> включить/выключить");
+    println!(" cfscanner [--sub-id ID] [флаги]");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_save_and_load_subs() -> anyhow::Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path();
+        let subs = vec![
+            Subscription {
+                id: 1,
+                name: "Test".into(),
+                url: "https://test.com".into(),
+                enabled: true,
+            },
+            Subscription {
+                id: 2,
+                name: "Other".into(),
+                url: "vmess://example.com".into(),
+                enabled: false,
+            },
+        ];
+        save_subs(path, &subs)?;
+        let loaded = load_subs(path)?;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Test");
+        assert_eq!(loaded[1].enabled, false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_subs_empty_file() -> anyhow::Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path();
+        fs::write(path, "[]")?;
+        let subs = load_subs(path)?;
+        assert!(subs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_subs_missing_file() -> anyhow::Result<()> {
+        let path = std::path::Path::new("/tmp/non_existent_file_for_test.json");
+        let subs = load_subs(path)?;
+        assert!(subs.is_empty());
+        Ok(())
+    }
 }

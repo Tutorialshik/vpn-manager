@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Проверка кода
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout репозитория
+      uses: actions/checkout@v4
+
+    - name: Установка Rust (стабильная версия)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Кеширование зависимостей
+      uses: Swatinem/rust-cache@v2
+
+    - name: Проверка форматирования (cargo fmt)
+      run: cargo fmt --check
+
+    - name: Статический анализ (cargo clippy)
+      run: cargo clippy -- -D warnings
+
+    - name: Запуск тестов (cargo test)
+      run: cargo test
+
+    - name: Установка cargo-audit
+      run: cargo install cargo-audit
+
+    - name: Аудит зависимостей (cargo audit)
+      run: cargo audit

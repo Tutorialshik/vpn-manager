@@ -1,6 +1,10 @@
-mod config;
 mod commands;
+mod config;
+mod db;
 mod geo;
+mod http_tester;
+mod knife;
+mod parallel_rules;
 mod proxy;
 mod settings;
 mod subs;
@@ -10,11 +14,15 @@ mod utils;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::AppConfig;
-use std::path::PathBuf;
-use std::process::Command as SysCommand;
+use http_tester::XrayKnifeHttpTester;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "vpn-manager", version, about = "Управление VPN подписками и прокси")]
+#[command(
+    name = "vpn-manager",
+    version,
+    about = "Управление VPN подписками и прокси"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -27,11 +35,9 @@ enum Commands {
         #[command(subcommand)]
         target: Option<StartTarget>,
 
-        /// Метод выбора профилей (random или fastest)
         #[arg(short = 'm', long = "method")]
         method: Option<String>,
 
-        /// Интервал ротации в секундах (по умолчанию 300)
         #[arg(short = 'r', long = "rotate")]
         rotate: Option<u64>,
 
@@ -42,6 +48,11 @@ enum Commands {
     Stop,
     #[command(about = "Перезапуск последнего профиля")]
     Restart,
+    #[command(about = "Сменить профиль не прерывая сессию")]
+    Change {
+        #[command(subcommand)]
+        action: Option<ChangeCmd>,
+    },
     #[command(about = "Управление подписками")]
     Subs {
         #[command(subcommand)]
@@ -56,35 +67,52 @@ enum Commands {
     Status,
 }
 
+// ── start ──────────────────────────────────────────────
+
 #[derive(Subcommand, Clone)]
 pub enum StartTarget {
-    /// Показать меню выбора профиля
+    #[command(about = "Показать меню выбора профиля")]
     Menu,
-    /// Запустить последний профиль
+    #[command(about = "Запустить последний профиль")]
     Now,
-    /// Запустить региональный файл (ru, eu, de, ...)
+    #[command(about = "Запустить региональный файл (ru, eu, de, ...)")]
     Region { region: String },
-    /// Запустить живые конфиги подписки по ID
+    #[command(about = "Запустить живые конфиги подписки по ID")]
     Sub { id: usize },
-    /// Выполнить команду в неймспейсе (xray-knife exec)
+    #[command(about = "Выполнить команду в неймспейсе (xray-knife exec)")]
     Exec { args: Vec<String> },
 }
 
+// ── change ─────────────────────────────────────────────
+
+#[derive(Subcommand, Clone)]
+pub enum ChangeCmd {
+    /// Следующий профиль в текущем списке
+    Next,
+    /// Предыдущий профиль
+    Prev,
+    /// Случайный профиль
+    Random,
+    /// Самый быстрый профиль (по данным статистики)
+    Fastest,
+}
+
+// ── subs ───────────────────────────────────────────────
+
 #[derive(Subcommand, Clone)]
 pub enum SubsCmd {
-    /// Показать список подписок и справку
+    #[command(about = "Показать список подписок и справку")]
     List,
-    /// Добавить подписку (интерактивно)
+    #[command(about = "Добавить подписку (интерактивно)")]
     Add,
-    /// Изменить подписку по ID
+    #[command(about = "Изменить подписку по ID")]
     Edit { id: usize },
-    /// Удалить подписки (all, 1, 2-4, 1,3,5)
+    #[command(about = "Удалить подписки (all, 1, 2-4, 1,3,5)")]
     Remove { ids: String },
-    /// Обновить подписки (all, 1, 2-4, 1,3,5)
+    #[command(about = "Обновить подписки (all, 1, 2-4, 1,3,5)")]
     Update {
         #[arg(required = false)]
         target: Option<String>,
-        /// Показать детальный вывод xray-knife
         #[arg(short = 'i', long = "info")]
         info: bool,
         #[arg(short = 'p', long = "protocol", default_value_t = String::from("all"))]
@@ -93,6 +121,9 @@ pub enum SubsCmd {
         limit: usize,
         #[arg(short = 'k', long = "keep-raw", default_value_t = true)]
         keep_raw: bool,
+        /// Загружать подписку через запущенный прокси (SOCKS5 на 127.0.0.1:порт)
+        #[arg(short = 'x', long = "via-proxy", default_value_t = false)]
+        via_proxy: bool,
     },
     #[command(about = "Включить/выключить подписки")]
     Switch {
@@ -110,29 +141,64 @@ pub enum SubsCmd {
 
 #[derive(Subcommand, Clone)]
 pub enum SwitchCmd {
+    #[command(about = "Включить подписки (1,2-4, all)")]
     On { ids: String },
+    #[command(about = "Выключить подписки (1,2-4, all)")]
     Off { ids: String },
 }
 
+// ── settings ───────────────────────────────────────────
+
 #[derive(Subcommand)]
 pub enum SettingsCmd {
-    Port { value: u16 },
-    Ip { value: String },
-    Proto { value: String },
-    Method { value: String },
-    Mode { value: String },
-    Core { value: String },
-    Rotate { seconds: u64 },
-    Insecure { on: bool },
-    Speedtest { on: bool },
-    HttpVerbose { on: bool },
-    Info { on: bool },
-    Parallel { value: usize },
+    Port {
+        value: u16,
+    },
+    Ip {
+        value: String,
+    },
+    Proto {
+        value: String,
+    },
+    Method {
+        value: String,
+    },
+    Mode {
+        value: String,
+    },
+    Core {
+        value: String,
+    },
+    Rotate {
+        seconds: u64,
+    },
+    Insecure {
+        on: bool,
+    },
+    Speedtest {
+        on: bool,
+    },
+    HttpVerbose {
+        on: bool,
+    },
+    Info {
+        on: bool,
+    },
+    Parallel {
+        value: usize,
+    },
     #[command(subcommand)]
     HttpUrls(HttpUrlsCmd),
-    BlacklistDuration { seconds: u64 },
-    BlacklistStrikes { strikes: u32 },
-    AutoUpdate { interval_min: u64, ids: Option<String> },
+    BlacklistDuration {
+        seconds: u64,
+    },
+    BlacklistStrikes {
+        strikes: u32,
+    },
+    AutoUpdate {
+        interval_min: u64,
+        ids: Option<String>,
+    },
     AutoMenuUpdate {
         #[arg(short = 'e', long = "enable")]
         enable: bool,
@@ -150,6 +216,8 @@ pub enum HttpUrlsCmd {
     Deactivate { ids: String },
 }
 
+// ── main ───────────────────────────────────────────────
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -166,10 +234,17 @@ fn main() -> Result<()> {
     let mut app_config = AppConfig::load_or_default(&config_path)?;
     let cmd_help = commands::load_commands(&commands_path).ok();
 
+    let db_path = PathBuf::from(&app_config.parallel_db_path);
+    let db = db::open_db(&db_path).ok();
+
     match cli.command {
-        Some(Commands::Start { target, method, rotate, extra_args }) => {
+        Some(Commands::Start {
+            target,
+            method,
+            rotate,
+            extra_args,
+        }) => {
             let target = target.unwrap_or(StartTarget::Menu);
-            // Собираем полный набор аргументов для xray-knife proxy
             let mut proxy_args = extra_args.clone();
             if let Some(m) = method {
                 proxy_args.push("-m".into());
@@ -182,16 +257,34 @@ fn main() -> Result<()> {
             match target {
                 StartTarget::Menu => proxy::show_start_help(&app_config, &subs_path),
                 StartTarget::Now => {
-                    proxy::handle_start("now", &proxy_args, &mut app_config, &config_path, &subs_path)?;
+                    proxy::handle_start(
+                        "now",
+                        &proxy_args,
+                        &mut app_config,
+                        &config_path,
+                        &subs_path,
+                    )?;
                 }
                 StartTarget::Region { region } => {
-                    proxy::handle_start(&region, &proxy_args, &mut app_config, &config_path, &subs_path)?;
+                    proxy::handle_start(
+                        &region,
+                        &proxy_args,
+                        &mut app_config,
+                        &config_path,
+                        &subs_path,
+                    )?;
                 }
                 StartTarget::Sub { id } => {
-                    proxy::handle_start(&format!("sub {}", id), &proxy_args, &mut app_config, &config_path, &subs_path)?;
+                    proxy::handle_start(
+                        &format!("sub {}", id),
+                        &proxy_args,
+                        &mut app_config,
+                        &config_path,
+                        &subs_path,
+                    )?;
                 }
                 StartTarget::Exec { args } => {
-                    run_xray_knife("exec", &args)?;
+                    knife::run_knife("exec", &args)?;
                 }
             }
         }
@@ -202,14 +295,19 @@ fn main() -> Result<()> {
             proxy::stop_proxy(&app_config)?;
             proxy::handle_start("now", &[], &mut app_config, &config_path, &subs_path)?;
         }
+        Some(Commands::Change { action }) => {
+            let action = action.unwrap_or(ChangeCmd::Next);
+            proxy::change_profile(action, &app_config, &subs_path)?;
+        }
         Some(Commands::Subs { action }) => {
-            subs::handle_subs_ext(action, &subs_path, &app_config)?;
+            let tester = XrayKnifeHttpTester;
+            subs::handle_subs_ext(action, &subs_path, &app_config, db.as_ref(), &tester)?;
         }
         Some(Commands::Settings { setting }) => {
             settings::handle_settings(setting, &mut app_config, &config_path, &subs_path)?;
         }
         Some(Commands::Status) => {
-            status(&app_config, &subs_path)?;
+            status(&app_config, &subs_path, db.as_ref())?;
         }
         None => {
             if let Some(help) = cmd_help {
@@ -223,7 +321,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn status(app: &AppConfig, subs_path: &PathBuf) -> Result<()> {
+fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>) -> Result<()> {
     let running = proxy::is_running(app);
     let (status_text, color) = if running {
         ("запущен", "\x1b[32m")
@@ -236,26 +334,35 @@ fn status(app: &AppConfig, subs_path: &PathBuf) -> Result<()> {
     println!("  Режим:           {}", app.last_mode_type);
     println!("  Ядро:            {}", app.core);
     println!("  Ротация:         {} с", app.rotate);
-    println!("  Insecure:        {}", if app.insecure { "вкл" } else { "выкл" });
-    println!("  Speedtest:       {}", if app.speedtest { "вкл" } else { "выкл" });
-    println!("  HTTP verbose:    {}", if app.http_verbose { "вкл" } else { "выкл" });
+    println!(
+        "  Insecure:        {}",
+        if app.insecure { "вкл" } else { "выкл" }
+    );
+    println!(
+        "  Speedtest:       {}",
+        if app.speedtest { "вкл" } else { "выкл" }
+    );
+    println!(
+        "  HTTP verbose:    {}",
+        if app.http_verbose {
+            "вкл"
+        } else {
+            "выкл"
+        }
+    );
     println!("  Прокси:          {}{}\x1b[0m", color, status_text);
 
-    // Информация о текущем конфиге (первый в используемом файле)
     if let Some(info) = proxy::get_current_config_info(app) {
-        println!("  Текущий сервер:  {} {} ({})", info.flag, info.country, info.host);
-        println!("  IP:              {} (протокол: {})", info.ip, info.protocol);
+        println!(
+            "  Текущий сервер:  {} {} ({})",
+            info.flag, info.country, info.host
+        );
+        println!(
+            "  IP:              {} (протокол: {})",
+            info.ip, info.protocol
+        );
     }
-    subs::list_subscriptions(subs_path, app);
-    Ok(())
-}
 
-pub fn run_xray_knife(cmd: &str, args: &[String]) -> Result<()> {
-    let mut child = SysCommand::new("xray-knife")
-        .arg(cmd)
-        .args(args)
-        .spawn()
-        .context("Не удалось запустить xray-knife")?;
-    child.wait()?;
+    subs::list_subscriptions(subs_path, app);
     Ok(())
 }

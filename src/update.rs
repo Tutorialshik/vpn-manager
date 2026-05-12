@@ -1,28 +1,41 @@
-use anyhow::{Context, Result};
-use reqwest::blocking::Client;
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use tempfile::NamedTempFile;
 use crate::config::AppConfig;
+use crate::geo;
+use crate::http_tester::{HttpTester, TestConfig};
+use crate::knife;
 use crate::subs::Subscription;
 use crate::utils;
-use crate::geo;
+use anyhow::{bail, Context, Result};
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+// use tempfile::NamedTempFile;
 
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn handle_update(
     target: &str,
     protocol: &str,
     limit: usize,
     keep_raw: bool,
+    show_info: bool,
     config: &AppConfig,
     subs_path: &Path,
+    db: Option<&Connection>,
+    tester: &dyn HttpTester,
 ) -> Result<()> {
     let subs = crate::subs::load_subs(subs_path)?;
-    let ids = if target == "all" { subs.iter().map(|s| s.id).collect() } else { utils::expand_ids(target)? };
+    let ids = if target == "all" {
+        subs.iter().map(|s| s.id).collect()
+    } else {
+        utils::expand_ids(target)?
+    };
     for id in ids {
         if let Some(sub) = subs.iter().find(|s| s.id == id) {
-            update_single_sub(sub, protocol, limit, keep_raw, false, config)?;
+            update_single_sub(
+                sub, protocol, limit, keep_raw, show_info, config, db, tester,
+            )?;
         } else {
             eprintln!("⚠️ Подписка {} не найдена", id);
         }
@@ -30,6 +43,7 @@ pub fn handle_update(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_single_sub(
     sub: &Subscription,
     proto: &str,
@@ -37,24 +51,25 @@ pub fn update_single_sub(
     keep_raw: bool,
     show_info: bool,
     config: &AppConfig,
+    db: Option<&Connection>,
+    tester: &dyn HttpTester,
 ) -> Result<()> {
     println!("ℹ️ Обновление [{}] {}", sub.id, sub.name);
-    let config_dir = dirs::config_dir().unwrap().join("vpn-manager");
+    let config_dir = dirs::config_dir()
+        .context("Не удалось определить config директорию")?
+        .join("vpn-manager");
     std::fs::create_dir_all(&config_dir)?;
 
-    // 1. Загрузка
+    // 1. Загрузка подписки
     let raw_path = format!("/tmp/vpn-sub-{}-raw.txt", sub.id);
     if sub.url.starts_with("http://") || sub.url.starts_with("https://") {
-        let client = Client::builder().no_proxy().build()?;
-        let resp = client.get(&sub.url).send()?;
-        let bytes = resp.bytes()?;
-        fs::write(&raw_path, bytes)?;
+        knife::fetch_subscription(&sub.url, Path::new(&raw_path))?;
     } else if sub.url.starts_with("file://") {
         fs::copy(sub.url.trim_start_matches("file://"), &raw_path)?;
     } else if Path::new(&sub.url).exists() {
         fs::copy(&sub.url, &raw_path)?;
     } else {
-        anyhow::bail!("Неизвестный источник: {}", sub.url);
+        bail!("Неизвестный источник: {}", sub.url);
     }
     let content = fs::read_to_string(&raw_path)?.replace('\r', "");
     fs::write(&raw_path, content)?;
@@ -63,14 +78,49 @@ pub fn update_single_sub(
     let filtered_path = format!("/tmp/vpn-sub-{}-filtered.txt", sub.id);
     utils::filter_subscription_file(&raw_path, &filtered_path, proto, limit)?;
 
-    // 3. HTTP тесты
+    // 3. HTTP тесты (через объект-тестер)
     let active_urls = utils::get_active_urls(config);
-    if active_urls.is_empty() { anyhow::bail!("Нет активных тестовых URL"); }
+    if active_urls.is_empty() {
+        bail!("Нет активных тестовых URL");
+    }
 
-    let live_files = run_http_tests(sub.id, &filtered_path, &active_urls, config, show_info)?;
-    if live_files.is_empty() { anyhow::bail!("Нет живых конфигов"); }
+    let test_config = TestConfig {
+        sub_id: sub.id,
+        timeout: config.http_test_timeout,
+        threads: config.http_test_threads,
+        insecure: config.insecure,
+        speedtest: config.speedtest,
+        show_info,
+        log_dir: PathBuf::from(&config.http_log_dir),
+        config,
+    };
 
-    // 4. Слияние и сохранение
+    let results = tester.run_tests(Path::new(&filtered_path), &active_urls, &test_config)?;
+
+    let live_files: Vec<PathBuf> = results
+        .into_iter()
+        .filter_map(|r| {
+            if r.success {
+                r.live_file_path
+            } else {
+                if let Some(err) = r.error {
+                    eprintln!("⚠️ Ошибка HTTP теста для {}: {}", r.url, err);
+                }
+                None
+            }
+        })
+        .collect();
+
+    if live_files.is_empty() {
+        bail!("Нет живых конфигов");
+    }
+
+    // 4. Сохранение статистики (если есть БД)
+    if let Some(conn) = db {
+        record_stats(sub.id, &active_urls, config, conn)?;
+    }
+
+    // 5. Слияние и сохранение
     let merged = format!("/tmp/vpn-sub-{}-live-merged.txt", sub.id);
     utils::merge_files(&live_files, &merged)?;
     let dest = config_dir.join(format!("sub_{}_live.txt", sub.id));
@@ -78,7 +128,7 @@ pub fn update_single_sub(
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     fs::write(config_dir.join(format!("sub_{}_timestamp.txt", sub.id)), ts)?;
 
-    // 5. Общий all_live и классификация
+    // 6. Общий all_live и классификация
     let mut all_live_content = String::new();
     for entry in fs::read_dir(&config_dir)? {
         let entry = entry?;
@@ -99,81 +149,98 @@ pub fn update_single_sub(
         let _ = fs::remove_file(&raw_path);
         let _ = fs::remove_file(&filtered_path);
         let _ = fs::remove_file(&merged);
-        for f in &live_files { let _ = fs::remove_file(f); }
+        for f in &live_files {
+            let _ = fs::remove_file(f);
+        }
     }
     println!("✅ Подписка [{}] обновлена", sub.id);
     Ok(())
 }
 
-fn run_http_tests(sub_id: usize, config_file: &str, urls: &[String], config: &AppConfig, show_info: bool) -> Result<Vec<PathBuf>> {
-    let timeout = config.http_test_timeout;
-    let threads = config.http_test_threads;
-    let insecure = config.insecure;
-    let speedtest = config.speedtest;
+fn record_stats(
+    sub_id: usize,
+    urls: &[String],
+    config: &AppConfig,
+    conn: &Connection,
+) -> Result<()> {
     let log_dir = PathBuf::from(&config.http_log_dir);
-    fs::create_dir_all(&log_dir)?;
-
-    let mut handles = vec![];
-    let config_file = config_file.to_owned();
+    let tx = conn.unchecked_transaction()?;
     for url in urls {
-        let url = url.clone();
-        let config_f = config_file.clone();
-        let log = log_dir.join(format!("vpn-http-{}-{}.log", sub_id, sanitize_filename(&url)));
-        let live_file = NamedTempFile::new()?.into_temp_path();
-        let live_path = live_file.to_path_buf();
-        let show_info = show_info.clone();
-        let handle = std::thread::spawn(move || -> Result<PathBuf> {
-            let mut cmd = Command::new("xray-knife");
-            cmd.arg("http")
-                .arg("-f").arg(&config_f)
-                .arg("-d").arg(timeout.to_string())
-                .arg("-t").arg(threads.to_string())
-                .arg("-u").arg(&url)
-                .arg("-o").arg(&live_path);
-            if insecure { cmd.arg("-e"); }
-            if speedtest { cmd.arg("--speedtest"); }
-
-            if show_info {
-                // Вывод на экран
-                cmd.stdout(std::process::Stdio::inherit())
-                   .stderr(std::process::Stdio::inherit());
-                let status = cmd.status()?;
-                if !status.success() { anyhow::bail!("xray-knife http завершился с ошибкой"); }
-            } else {
-                let output = cmd.output()?;
-                if let Ok(mut f) = fs::File::create(&log) {
-                    f.write_all(&output.stdout).ok();
-                    f.write_all(&output.stderr).ok();
-                }
+        let log_path = log_dir.join(format!(
+            "vpn-http-{}-{}.log",
+            sub_id,
+            sanitize_filename(url)
+        ));
+        if !log_path.exists() {
+            continue;
+        }
+        let file = fs::File::open(&log_path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.find("://").is_some() {
+                let link = line[..line.find(' ').unwrap_or(line.len())].to_string();
+                let hash = format!("{:x}", Sha256::digest(link.as_bytes()));
+                let host = url::Url::parse(url)
+                    .map(|u| u.host_str().unwrap_or("unknown").to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let latency = extract_latency(&line);
+                let bandwidth = extract_bandwidth(&line);
+                let score = calculate_score(latency, bandwidth, &config.parallel_strategy);
+                tx.execute(
+                    "INSERT INTO profile_host_stats (host, profile_link_hash, success_count, avg_latency_ms, avg_bandwidth_mbps, score, last_used)
+                     VALUES (?1, ?2, 1, ?3, ?4, ?5, strftime('%s','now'))
+                     ON CONFLICT(host, profile_link_hash) DO UPDATE SET
+                     success_count = success_count + 1,
+                     avg_latency_ms = (avg_latency_ms * success_count + ?3) / (success_count + 1),
+                     avg_bandwidth_mbps = (avg_bandwidth_mbps * success_count + ?4) / (success_count + 1),
+                     score = ?5,
+                     last_used = strftime('%s','now')",
+                    rusqlite::params![host, hash, latency.unwrap_or(999.0), bandwidth.unwrap_or(0.0), score],
+                )?;
             }
-
-            if Path::new(&live_path).exists() && fs::metadata(&live_path)?.len() > 0 {
-                let perm_path = std::path::PathBuf::from(format!("/tmp/vpn-sub-{}-live-{}.txt", sub_id, sanitize_filename(&url)));
-                fs::rename(&live_path, &perm_path)?;
-                Ok(perm_path)
-            } else {
-                anyhow::bail!("empty live result")
-            }
-        });
-        handles.push(handle);
-    }
-
-    let mut live_paths = vec![];
-    for h in handles {
-        match h.join().unwrap() {
-            Ok(p) => live_paths.push(p),
-            Err(e) => eprintln!("⚠️ Ошибка HTTP теста: {e}"),
         }
     }
-    Ok(live_paths)
+    tx.commit()?;
+    Ok(())
+}
+
+fn extract_latency(line: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"Delay: (\d+)ms").ok()?;
+    re.captures(line)?.get(1)?.as_str().parse::<f64>().ok()
+}
+
+fn extract_bandwidth(line: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"Speed: ([\d.]+) Mbps").ok()?;
+    re.captures(line)?.get(1)?.as_str().parse::<f64>().ok()
+}
+
+fn calculate_score(latency: Option<f64>, bandwidth: Option<f64>, strategy: &str) -> f64 {
+    match strategy {
+        "latency" => {
+            if let Some(lat) = latency {
+                1000.0 / lat
+            } else {
+                0.0
+            }
+        }
+        "bandwidth" => bandwidth.unwrap_or(0.0),
+        _ => 1.0,
+    }
 }
 
 fn sanitize_filename(s: &str) -> String {
-    s.replace('/', "_").replace(':', "_").replace('?', "_").replace('&', "_")
+    s.replace(['/', ':', '?', '&'], "_")
 }
 
 fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
-    let lists_dir = dirs::config_dir().unwrap().join("vpn-manager").join("lists");
+    let config_dir = dirs::config_dir()
+        .context("Не удалось определить config директорию")?
+        .join("vpn-manager");
+    let lists_dir = config_dir.join("lists");
     fs::create_dir_all(&lists_dir)?;
     let eu_countries = "AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE CH GB IS NO";
     let eu_list: Vec<&str> = eu_countries.split_whitespace().collect();
@@ -181,7 +248,8 @@ fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
     let content = fs::read_to_string(input_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let mut regions: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut regions: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     regions.insert("all".into(), vec![]);
     for region in &["ru", "us", "eu", "de", "pl", "fi", "nl", "other"] {
         regions.insert(region.to_string(), vec![]);
@@ -189,11 +257,19 @@ fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
 
     let mut skipped = 0;
     for line in &lines {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let host = utils::extract_host(line);
-        if host == "unknown" { skipped += 1; continue; }
+        if host == "unknown" {
+            skipped += 1;
+            continue;
+        }
         let ip = utils::resolve_ip(&host);
-        if ip.is_none() { skipped += 1; continue; }
+        if ip.is_none() {
+            skipped += 1;
+            continue;
+        }
         let ip = ip.unwrap();
         let code = geo::country_code(&ip, &config.geoip_db);
         let region = match code.as_deref() {
@@ -218,6 +294,10 @@ fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
         let file_path = lists_dir.join(format!("{}.txt", region));
         fs::write(file_path, lines.join("\n") + "\n")?;
     }
-    println!("🌍 Классификация завершена: {} обработано, {} пропущено", total - skipped, skipped);
+    println!(
+        "🌍 Классификация завершена: {} обработано, {} пропущено",
+        total - skipped,
+        skipped
+    );
     Ok(())
 }

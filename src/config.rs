@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct AppConfig {
     pub default_port: u16,
     pub listen_ip: String,
@@ -36,6 +37,15 @@ pub struct AppConfig {
     pub show_update_info: bool,
     pub auto_menu_update_enabled: bool,
     pub auto_menu_update_interval: u64,
+
+    // Параллелизация и гео-балансировка
+    pub parallel_enabled: bool,
+    pub parallel_geo_balancing: bool,
+    pub parallel_geo_cache_ttl: u64,
+    pub parallel_max_profiles: usize,
+    pub parallel_timeout_ms: u64,
+    pub parallel_strategy: String,
+    pub parallel_db_path: String,
 }
 
 impl Default for AppConfig {
@@ -75,6 +85,13 @@ impl Default for AppConfig {
             show_update_info: false,
             auto_menu_update_enabled: false,
             auto_menu_update_interval: 0,
+            parallel_enabled: false,
+            parallel_geo_balancing: false,
+            parallel_geo_cache_ttl: 3600,
+            parallel_max_profiles: 3,
+            parallel_timeout_ms: 5000,
+            parallel_strategy: "latency".into(),
+            parallel_db_path: config_dir.join("parallel_stats.db").to_string_lossy().into(),
         }
     }
 }
