@@ -1,18 +1,20 @@
-use crate::config::AppConfig;
 use crate::geo;
-use crate::http_tester::{HttpTester, TestConfig};
-use crate::knife;
-use crate::subs::Subscription;
-use crate::utils;
-use anyhow::{bail, Context, Result};
+use crate::l10n;
+use anyhow::Context;
+use chrono::Local;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::fs;
+// use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-// use tempfile::NamedTempFile;
+use vpn_core::config::AppConfig;
+use vpn_core::http_tester::HttpTester;
+use vpn_core::utils;
+use vpn_subs::crud;
+use vpn_subs::update as subs_update;
 
-#[allow(dead_code)]
+/// Координирует обновление одной или нескольких подписок, вызывает vpn-subs
 #[allow(clippy::too_many_arguments)]
 pub fn handle_update(
     target: &str,
@@ -24,8 +26,8 @@ pub fn handle_update(
     subs_path: &Path,
     db: Option<&Connection>,
     tester: &dyn HttpTester,
-) -> Result<()> {
-    let subs = crate::subs::load_subs(subs_path)?;
+) -> anyhow::Result<()> {
+    let subs = crud::load_subs(subs_path)?;
     let ids = if target == "all" {
         subs.iter().map(|s| s.id).collect()
     } else {
@@ -33,19 +35,20 @@ pub fn handle_update(
     };
     for id in ids {
         if let Some(sub) = subs.iter().find(|s| s.id == id) {
-            update_single_sub(
+            update_single(
                 sub, protocol, limit, keep_raw, show_info, config, db, tester,
             )?;
         } else {
-            eprintln!("⚠️ Подписка {} не найдена", id);
+            eprintln!("{}", l10n::t_fmt("subs.subs_not_found", &[&id.to_string()]));
         }
     }
     Ok(())
 }
 
+/// Обновляет одну подписку: загрузка, фильтрация, тесты, сохранение, классификация
 #[allow(clippy::too_many_arguments)]
-pub fn update_single_sub(
-    sub: &Subscription,
+fn update_single(
+    sub: &vpn_core::types::Subscription,
     proto: &str,
     limit: usize,
     keep_raw: bool,
@@ -53,82 +56,34 @@ pub fn update_single_sub(
     config: &AppConfig,
     db: Option<&Connection>,
     tester: &dyn HttpTester,
-) -> Result<()> {
-    println!("ℹ️ Обновление [{}] {}", sub.id, sub.name);
+) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        l10n::t_fmt("subs.update_started", &[&sub.id.to_string(), &sub.name])
+    );
     let config_dir = dirs::config_dir()
-        .context("Не удалось определить config директорию")?
+        .context(l10n::t("proxy.config_dir_missing"))?
         .join("vpn-manager");
-    std::fs::create_dir_all(&config_dir)?;
 
-    // 1. Загрузка подписки
-    let raw_path = format!("/tmp/vpn-sub-{}-raw.txt", sub.id);
-    if sub.url.starts_with("http://") || sub.url.starts_with("https://") {
-        knife::fetch_subscription(&sub.url, Path::new(&raw_path))?;
-    } else if sub.url.starts_with("file://") {
-        fs::copy(sub.url.trim_start_matches("file://"), &raw_path)?;
-    } else if Path::new(&sub.url).exists() {
-        fs::copy(&sub.url, &raw_path)?;
-    } else {
-        bail!("Неизвестный источник: {}", sub.url);
-    }
-    let content = fs::read_to_string(&raw_path)?.replace('\r', "");
-    fs::write(&raw_path, content)?;
+    // 1. Загрузка через vpn-subs (теперь внутри update_single_sub)
+    let live_files =
+        subs_update::update_single_sub(sub, proto, limit, keep_raw, show_info, config, tester)?;
 
-    // 2. Фильтрация
-    let filtered_path = format!("/tmp/vpn-sub-{}-filtered.txt", sub.id);
-    utils::filter_subscription_file(&raw_path, &filtered_path, proto, limit)?;
-
-    // 3. HTTP тесты (через объект-тестер)
-    let active_urls = utils::get_active_urls(config);
-    if active_urls.is_empty() {
-        bail!("Нет активных тестовых URL");
-    }
-
-    let test_config = TestConfig {
-        sub_id: sub.id,
-        timeout: config.http_test_timeout,
-        threads: config.http_test_threads,
-        insecure: config.insecure,
-        speedtest: config.speedtest,
-        show_info,
-        log_dir: PathBuf::from(&config.http_log_dir),
-        config,
-    };
-
-    let results = tester.run_tests(Path::new(&filtered_path), &active_urls, &test_config)?;
-
-    let live_files: Vec<PathBuf> = results
-        .into_iter()
-        .filter_map(|r| {
-            if r.success {
-                r.live_file_path
-            } else {
-                if let Some(err) = r.error {
-                    eprintln!("⚠️ Ошибка HTTP теста для {}: {}", r.url, err);
-                }
-                None
-            }
-        })
-        .collect();
-
-    if live_files.is_empty() {
-        bail!("Нет живых конфигов");
-    }
-
-    // 4. Сохранение статистики (если есть БД)
-    if let Some(conn) = db {
-        record_stats(sub.id, &active_urls, config, conn)?;
-    }
-
-    // 5. Слияние и сохранение
+    // 2. Сохранение результатов (слияние, запись в файлы)
     let merged = format!("/tmp/vpn-sub-{}-live-merged.txt", sub.id);
     utils::merge_files(&live_files, &merged)?;
     let dest = config_dir.join(format!("sub_{}_live.txt", sub.id));
     fs::copy(&merged, &dest)?;
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let ts = Local::now().format("%Y-%m-%d %H:%M").to_string();
     fs::write(config_dir.join(format!("sub_{}_timestamp.txt", sub.id)), ts)?;
 
-    // 6. Общий all_live и классификация
+    // 3. Статистика (если есть БД)
+    if let Some(conn) = db {
+        let active_urls = utils::get_active_urls(config);
+        record_stats(sub.id, &active_urls, config, conn)?;
+    }
+
+    // 4. Обновление all_live и классификация
     let mut all_live_content = String::new();
     for entry in fs::read_dir(&config_dir)? {
         let entry = entry?;
@@ -146,23 +101,28 @@ pub fn update_single_sub(
     classify_configs(&all_live, config)?;
 
     if !keep_raw {
-        let _ = fs::remove_file(&raw_path);
-        let _ = fs::remove_file(&filtered_path);
+        // Удаляем временные файлы (можно оставить, но пока уберём)
+        let _ = fs::remove_file(format!("/tmp/vpn-sub-{}-raw.txt", sub.id));
+        let _ = fs::remove_file(format!("/tmp/vpn-sub-{}-filtered.txt", sub.id));
         let _ = fs::remove_file(&merged);
         for f in &live_files {
             let _ = fs::remove_file(f);
         }
     }
-    println!("✅ Подписка [{}] обновлена", sub.id);
+    println!(
+        "{}",
+        l10n::t_fmt("subs.update_finished", &[&sub.id.to_string()])
+    );
     Ok(())
 }
 
+/// Запись статистики в БД
 fn record_stats(
     sub_id: usize,
     urls: &[String],
     config: &AppConfig,
     conn: &Connection,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let log_dir = PathBuf::from(&config.http_log_dir);
     let tx = conn.unchecked_transaction()?;
     for url in urls {
@@ -232,13 +192,14 @@ fn calculate_score(latency: Option<f64>, bandwidth: Option<f64>, strategy: &str)
     }
 }
 
-fn sanitize_filename(s: &str) -> String {
+pub(crate) fn sanitize_filename(s: &str) -> String {
     s.replace(['/', ':', '?', '&'], "_")
 }
 
-fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
+/// Классификация конфигов по странам
+fn classify_configs(input_path: &Path, config: &AppConfig) -> anyhow::Result<()> {
     let config_dir = dirs::config_dir()
-        .context("Не удалось определить config директорию")?
+        .context(l10n::t("proxy.config_dir_missing"))?
         .join("vpn-manager");
     let lists_dir = config_dir.join("lists");
     fs::create_dir_all(&lists_dir)?;
@@ -295,9 +256,67 @@ fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
         fs::write(file_path, lines.join("\n") + "\n")?;
     }
     println!(
-        "🌍 Классификация завершена: {} обработано, {} пропущено",
-        total - skipped,
-        skipped
+        "{}",
+        l10n::t_fmt(
+            "subs.classify_finished",
+            &[&(total - skipped).to_string(), &skipped.to_string()]
+        )
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use rusqlite::Connection;
+    use vpn_core::config::AppConfig;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS profile_host_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT NOT NULL,
+                profile_link_hash TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                avg_latency_ms REAL,
+                avg_bandwidth_mbps REAL,
+                last_used INTEGER,
+                score REAL,
+                UNIQUE(host, profile_link_hash)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_record_stats() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log_dir = dir.path();
+        // Используем ту же sanitize_filename, что и record_stats
+        let sanitized = sanitize_filename("https://test.com");
+        let log_file = log_dir.join(format!("vpn-http-1-{}.log", sanitized));
+        std::fs::write(
+            &log_file,
+            "https://test.com Delay: 150ms Speed: 50.0 Mbps\n",
+        )?;
+
+        let mut config = AppConfig::default();
+        config.http_log_dir = log_dir.to_str().unwrap().to_string();
+
+        let conn = setup_db();
+        let urls = vec!["https://test.com".to_string()];
+
+        record_stats(1, &urls, &config, &conn)?;
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM profile_host_stats", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
 }

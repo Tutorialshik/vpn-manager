@@ -1,3 +1,4 @@
+use crate::l10n;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -33,7 +34,6 @@ impl GlobalHelp {
         let mut out = format!("{}\n\n", self.description);
         for (cmd, desc) in &self.commands {
             if desc.is_empty() {
-                // просто выводим заголовок-разделитель
                 out.push_str(&format!("{}\n", cmd));
             } else {
                 out.push_str(&format!("  {:12} - {}\n", cmd, desc));
@@ -45,5 +45,5 @@ impl GlobalHelp {
 
 pub fn load_commands(path: &Path) -> Result<CommandsHelp> {
     let content = fs::read_to_string(path)?;
-    serde_json::from_str(&content).context("Ошибка парсинга commands.json")
+    serde_json::from_str(&content).context(l10n::t("commands.parse_error"))
 }

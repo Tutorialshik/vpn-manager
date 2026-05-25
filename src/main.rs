@@ -1,21 +1,20 @@
 mod commands;
-mod config;
 mod db;
 mod geo;
 mod http_tester;
 mod knife;
-mod parallel_rules;
+mod l10n;
 mod proxy;
 mod settings;
 mod subs;
 mod update;
-mod utils;
 
+// use crate::l10n;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::AppConfig;
 use http_tester::XrayKnifeHttpTester;
 use std::path::{Path, PathBuf};
+use vpn_core::config::AppConfig;
 
 #[derive(Parser)]
 #[command(
@@ -32,15 +31,13 @@ struct Cli {
 enum Commands {
     #[command(about = "Запуск прокси")]
     Start {
-        #[command(subcommand)]
-        target: Option<StartTarget>,
-
         #[arg(short = 'm', long = "method")]
         method: Option<String>,
 
         #[arg(short = 'r', long = "rotate")]
         rotate: Option<u64>,
 
+        /// Цель и дополнительные аргументы (menu, now, region <регион>, sub <ID>, exec <команда...>)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -67,49 +64,24 @@ enum Commands {
     Status,
 }
 
-// ── start ──────────────────────────────────────────────
-
-#[derive(Subcommand, Clone)]
-pub enum StartTarget {
-    #[command(about = "Показать меню выбора профиля")]
-    Menu,
-    #[command(about = "Запустить последний профиль")]
-    Now,
-    #[command(about = "Запустить региональный файл (ru, eu, de, ...)")]
-    Region { region: String },
-    #[command(about = "Запустить живые конфиги подписки по ID")]
-    Sub { id: usize },
-    #[command(about = "Выполнить команду в неймспейсе (xray-knife exec)")]
-    Exec { args: Vec<String> },
-}
-
-// ── change ─────────────────────────────────────────────
-
 #[derive(Subcommand, Clone)]
 pub enum ChangeCmd {
-    /// Следующий профиль в текущем списке
     Next,
-    /// Предыдущий профиль
     Prev,
-    /// Случайный профиль
     Random,
-    /// Самый быстрый профиль (по данным статистики)
     Fastest,
 }
 
-// ── subs ───────────────────────────────────────────────
-
 #[derive(Subcommand, Clone)]
 pub enum SubsCmd {
-    #[command(about = "Показать список подписок и справку")]
     List,
-    #[command(about = "Добавить подписку (интерактивно)")]
     Add,
-    #[command(about = "Изменить подписку по ID")]
-    Edit { id: usize },
-    #[command(about = "Удалить подписки (all, 1, 2-4, 1,3,5)")]
-    Remove { ids: String },
-    #[command(about = "Обновить подписки (all, 1, 2-4, 1,3,5)")]
+    Edit {
+        id: usize,
+    },
+    Remove {
+        ids: String,
+    },
     Update {
         #[arg(required = false)]
         target: Option<String>,
@@ -121,16 +93,13 @@ pub enum SubsCmd {
         limit: usize,
         #[arg(short = 'k', long = "keep-raw", default_value_t = true)]
         keep_raw: bool,
-        /// Загружать подписку через запущенный прокси (SOCKS5 на 127.0.0.1:порт)
         #[arg(short = 'x', long = "via-proxy", default_value_t = false)]
         via_proxy: bool,
     },
-    #[command(about = "Включить/выключить подписки")]
     Switch {
         #[command(subcommand)]
         action: SwitchCmd,
     },
-    #[command(about = "Сканер Cloudflare IP")]
     Cfscanner {
         #[arg(long = "sub-id")]
         sub_id: Option<usize>,
@@ -141,13 +110,9 @@ pub enum SubsCmd {
 
 #[derive(Subcommand, Clone)]
 pub enum SwitchCmd {
-    #[command(about = "Включить подписки (1,2-4, all)")]
     On { ids: String },
-    #[command(about = "Выключить подписки (1,2-4, all)")]
     Off { ids: String },
 }
-
-// ── settings ───────────────────────────────────────────
 
 #[derive(Subcommand)]
 pub enum SettingsCmd {
@@ -216,16 +181,30 @@ pub enum HttpUrlsCmd {
     Deactivate { ids: String },
 }
 
-// ── main ───────────────────────────────────────────────
-
 fn main() -> Result<()> {
     env_logger::init();
-    let cli = Cli::parse();
 
+    // Инициализация локализации
     let config_dir = dirs::config_dir()
-        .context("Не удалось определить config директорию")?
+        .context(l10n::t("main.dir_missing"))?
         .join("vpn-manager");
-    std::fs::create_dir_all(&config_dir).context("Не удалось создать директорию конфига")?;
+    std::fs::create_dir_all(&config_dir).context(l10n::t("main.create_dir_fail"))?;
+    let locales_dir = config_dir.join("locales");
+    std::fs::create_dir_all(&locales_dir)?;
+    let locale_path = locales_dir.join("ru.json");
+    if !locale_path.exists() {
+        if let Some(embedded) = option_env!("EMBED_LOCALE_RU") {
+            std::fs::write(&locale_path, embedded)?;
+        } else {
+            let src = PathBuf::from("locales/ru.json");
+            if src.exists() {
+                std::fs::copy(&src, &locale_path)?;
+            }
+        }
+    }
+    l10n::init(&locale_path)?;
+
+    let cli = Cli::parse();
 
     let config_path = config_dir.join("config.json");
     let commands_path = config_dir.join("commands.json");
@@ -239,13 +218,21 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Start {
-            target,
             method,
             rotate,
             extra_args,
         }) => {
-            let target = target.unwrap_or(StartTarget::Menu);
-            let mut proxy_args = extra_args.clone();
+            let target = if extra_args.is_empty() {
+                "menu".to_string()
+            } else {
+                extra_args[0].clone()
+            };
+            let mut proxy_args: Vec<String> = if extra_args.len() > 1 {
+                extra_args[1..].to_vec()
+            } else {
+                vec![]
+            };
+
             if let Some(m) = method {
                 proxy_args.push("-m".into());
                 proxy_args.push(m);
@@ -254,7 +241,9 @@ fn main() -> Result<()> {
                 proxy_args.push("-r".into());
                 proxy_args.push(r.to_string());
             }
-            match target {
+
+            let target_parsed = parse_start_target(&target, &mut proxy_args)?;
+            match target_parsed {
                 StartTarget::Menu => proxy::show_start_help(&app_config, &subs_path),
                 StartTarget::Now => {
                     proxy::handle_start(
@@ -288,9 +277,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Stop) => {
-            proxy::stop_proxy(&app_config)?;
-        }
+        Some(Commands::Stop) => proxy::stop_proxy(&app_config)?,
         Some(Commands::Restart) => {
             proxy::stop_proxy(&app_config)?;
             proxy::handle_start("now", &[], &mut app_config, &config_path, &subs_path)?;
@@ -313,7 +300,7 @@ fn main() -> Result<()> {
             if let Some(help) = cmd_help {
                 println!("{}", help.global_help.global_usage());
             } else {
-                println!("Не загружены описания команд. Используйте --help");
+                println!("{}", l10n::t("main.no_help"));
             }
         }
     }
@@ -321,48 +308,126 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+enum StartTarget {
+    Menu,
+    Now,
+    Region { region: String },
+    Sub { id: usize },
+    Exec { args: Vec<String> },
+}
+
+fn parse_start_target(target: &str, proxy_args: &mut Vec<String>) -> Result<StartTarget> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || trimmed == "menu" {
+        Ok(StartTarget::Menu)
+    } else if trimmed == "now" {
+        Ok(StartTarget::Now)
+    } else if trimmed == "region" {
+        if proxy_args.is_empty() {
+            Err(anyhow::anyhow!(l10n::t_fmt(
+                "proxy.unknown_target",
+                &[target]
+            )))
+        } else {
+            let region = proxy_args.remove(0);
+            Ok(StartTarget::Region { region })
+        }
+    } else if trimmed == "sub" {
+        if proxy_args.is_empty() {
+            Err(anyhow::anyhow!(l10n::t_fmt(
+                "proxy.unknown_target",
+                &[target]
+            )))
+        } else {
+            let id: usize = proxy_args.remove(0).parse()?;
+            Ok(StartTarget::Sub { id })
+        }
+    } else if trimmed == "exec" {
+        let args = std::mem::take(proxy_args);
+        Ok(StartTarget::Exec { args })
+    } else if vpn_core::utils::resolve_region(trimmed).is_some() {
+        Ok(StartTarget::Region {
+            region: trimmed.to_owned(),
+        })
+    } else {
+        Err(anyhow::anyhow!(l10n::t_fmt(
+            "proxy.unknown_target",
+            &[target]
+        )))
+    }
+}
+
 fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>) -> Result<()> {
     let running = proxy::is_running(app);
     let (status_text, color) = if running {
-        ("запущен", "\x1b[32m")
+        (l10n::t("status.running"), "\x1b[32m")
     } else {
-        ("не запущен", "\x1b[31m")
+        (l10n::t("status.not_running"), "\x1b[31m")
     };
-    println!("═══════════════════ Состояние ═══════════════════");
-    println!("  Порт:            {}", app.default_port);
-    println!("  Регион:          {}", app.last_region);
-    println!("  Режим:           {}", app.last_mode_type);
-    println!("  Ядро:            {}", app.core);
-    println!("  Ротация:         {} с", app.rotate);
+    println!("{}", l10n::t("status.title"));
     println!(
-        "  Insecure:        {}",
-        if app.insecure { "вкл" } else { "выкл" }
+        "{}",
+        l10n::t_fmt("status.port", &[&app.default_port.to_string()])
+    );
+    println!("{}", l10n::t_fmt("status.region", &[&app.last_region]));
+    println!("{}", l10n::t_fmt("status.mode", &[&app.last_mode_type]));
+    println!("{}", l10n::t_fmt("status.core", &[&app.core]));
+    println!(
+        "{}",
+        l10n::t_fmt("status.rotate", &[&app.rotate.to_string()])
     );
     println!(
-        "  Speedtest:       {}",
-        if app.speedtest { "вкл" } else { "выкл" }
+        "{}",
+        l10n::t_fmt(
+            "status.insecure",
+            &[if app.insecure {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
     );
     println!(
-        "  HTTP verbose:    {}",
-        if app.http_verbose {
-            "вкл"
-        } else {
-            "выкл"
-        }
+        "{}",
+        l10n::t_fmt(
+            "status.speedtest",
+            &[if app.speedtest {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
     );
-    println!("  Прокси:          {}{}\x1b[0m", color, status_text);
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "status.http_verbose",
+            &[if app.http_verbose {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt("status.proxy_running", &[color, &status_text])
+    );
 
     if let Some(info) = proxy::get_current_config_info(app) {
         println!(
-            "  Текущий сервер:  {} {} ({})",
-            info.flag, info.country, info.host
+            "{}",
+            l10n::t_fmt("status.server", &[&info.flag, &info.country, &info.host])
         );
         println!(
-            "  IP:              {} (протокол: {})",
-            info.ip, info.protocol
+            "{}",
+            l10n::t_fmt("status.ip_proto", &[&info.ip, &info.protocol])
         );
     }
 
-    subs::list_subscriptions(subs_path, app);
+    vpn_subs::crud::list_subscriptions(subs_path, app);
     Ok(())
 }

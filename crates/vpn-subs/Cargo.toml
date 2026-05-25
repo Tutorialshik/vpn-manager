@@ -1,0 +1,16 @@
+[package]
+name = "vpn-subs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+reqwest = { version = "0.12", features = ["blocking", "socks"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "4.0"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3.3"

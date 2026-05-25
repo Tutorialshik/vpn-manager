@@ -1,24 +1,24 @@
+use crate::l10n;
+use crate::t;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::{Child, Command};
 
-/// Загрузить подписку через xray-knife subs fetch
+#[allow(dead_code)]
 pub fn fetch_subscription(url: &str, output: &Path) -> Result<()> {
     let status = Command::new("xray-knife")
         .args(["subs", "fetch", "-u", url, "-o", output.to_str().unwrap()])
         .status()
-        .context("Не удалось запустить xray-knife subs fetch")?;
+        .context(t!("knife.fetch_error"))?;
     if !status.success() {
-        bail!(
-            "xray-knife subs fetch завершился с ошибкой (код {:?})",
-            status.code()
-        );
+        bail!(l10n::t_fmt(
+            "knife.fetch_failed",
+            &[&status.code().unwrap_or(1).to_string()]
+        ));
     }
     Ok(())
 }
 
-/// Запустить HTTP-тест одного URL и сохранить живые конфиги в `live_file`.
-/// Возвращает `true`, если файл с живыми конфигами был создан и не пуст.
 #[allow(clippy::too_many_arguments)]
 pub fn run_single_http_test(
     config_file: &Path,
@@ -55,7 +55,7 @@ pub fn run_single_http_test(
             .stderr(std::process::Stdio::inherit());
         let status = cmd.status()?;
         if !status.success() {
-            bail!("xray-knife http завершился с ошибкой");
+            bail!(t!("knife.http_error"));
         }
     } else {
         let output = cmd.output()?;
@@ -64,7 +64,6 @@ pub fn run_single_http_test(
             f.write_all(&output.stdout).ok();
             f.write_all(&output.stderr).ok();
         }
-        // Если вывод был скрыт, всё равно проверяем, что живой файл создался
     }
 
     if live_file.exists() {
@@ -76,8 +75,6 @@ pub fn run_single_http_test(
     Ok(false)
 }
 
-/// Запустить прокси xray-knife и вернуть дочерний процесс.
-/// Аргументы должны включать `-f` с путём к файлу конфигурации и остальные флаги.
 pub fn spawn_proxy(args: &[String], log_file: &Path) -> Result<Child> {
     let log = std::fs::File::create(log_file)?;
     Command::new("xray-knife")
@@ -86,16 +83,15 @@ pub fn spawn_proxy(args: &[String], log_file: &Path) -> Result<Child> {
         .stdout(std::process::Stdio::from(log.try_clone()?))
         .stderr(std::process::Stdio::from(log))
         .spawn()
-        .context("Не удалось запустить xray-knife proxy")
+        .context(t!("knife.proxy_start_fail"))
 }
 
-/// Запустить произвольную команду xray-knife (например, cfscanner) с аргументами.
 pub fn run_knife(cmd: &str, args: &[String]) -> Result<()> {
     let mut child = Command::new("xray-knife")
         .arg(cmd)
         .args(args)
         .spawn()
-        .context("Не удалось запустить xray-knife")?;
+        .context(t!("knife.knife_start_fail"))?;
     child.wait()?;
     Ok(())
 }

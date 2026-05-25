@@ -1,12 +1,6 @@
-use crate::config::AppConfig;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::fs;
 use std::net::ToSocketAddrs;
-
-#[allow(dead_code)]
-pub fn trim(s: &str) -> String {
-    s.trim().to_string()
-}
 
 pub fn extract_host(link: &str) -> String {
     if link.starts_with("vless://") || link.starts_with("trojan://") || link.starts_with("ss://") {
@@ -52,12 +46,12 @@ pub fn expand_ids(spec: &str) -> Result<Vec<usize>> {
         if part.contains('-') {
             let bounds: Vec<&str> = part.split('-').collect();
             if bounds.len() != 2 {
-                bail!("неверный диапазон: {}", part);
+                anyhow::bail!("неверный диапазон: {}", part);
             }
             let start: usize = bounds[0].parse()?;
             let end: usize = bounds[1].parse()?;
             if start > end {
-                bail!("начало диапазона больше конца: {}-{}", start, end);
+                anyhow::bail!("начало диапазона больше конца: {}-{}", start, end);
             }
             ids.extend(start..=end);
         } else {
@@ -96,7 +90,7 @@ pub fn filter_subscription_file(
     Ok(())
 }
 
-pub fn get_active_urls(config: &AppConfig) -> Vec<String> {
+pub fn get_active_urls(config: &crate::config::AppConfig) -> Vec<String> {
     let active_ids: Vec<&str> = config
         .http_url_active_ids
         .split(',')
@@ -145,6 +139,7 @@ pub fn resolve_region(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -227,7 +222,6 @@ mod tests {
         )?;
 
         let result = fs::read_to_string(output_file.path())?;
-        // limit=2, должно остаться только первые две строки
         assert_eq!(result, "vless://a\nvless://b\n");
         Ok(())
     }
@@ -247,5 +241,30 @@ mod tests {
     #[test]
     fn test_resolve_region_unknown() {
         assert_eq!(resolve_region("unknown"), None);
+    }
+
+    #[test]
+    fn test_get_active_urls() {
+        let mut config = crate::config::AppConfig::default();
+        config.http_url_active_ids = "1,3".into();
+        config.http_url_pool_data =
+            "1|https://test1.com;2|https://test2.com;3|https://test3.com".into();
+        let urls = get_active_urls(&config);
+        assert_eq!(urls, vec!["https://test1.com", "https://test3.com"]);
+    }
+
+    #[test]
+    fn test_merge_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let f1 = dir.path().join("f1.txt");
+        let f2 = dir.path().join("f2.txt");
+        std::fs::write(&f1, "line1\nline2\n")?;
+        std::fs::write(&f2, "line2\nline3\n")?;
+        let output = dir.path().join("merged.txt");
+        let out_str = output.to_str().unwrap();
+        merge_files(&[f1, f2], out_str)?;
+        let result = std::fs::read_to_string(&output)?;
+        assert_eq!(result, "line1\nline2\nline3\n"); // unique_lines сортирует и убирает дубли
+        Ok(())
     }
 }

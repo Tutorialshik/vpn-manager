@@ -1,36 +1,8 @@
-use crate::config::AppConfig;
 use crate::knife;
+use crate::l10n;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone)]
-pub struct LiveResult {
-    pub url: String,
-    pub success: bool,
-    pub live_file_path: Option<PathBuf>,
-    pub error: Option<String>,
-}
-
-pub struct TestConfig<'a> {
-    pub sub_id: usize,
-    pub timeout: u64,
-    pub threads: usize,
-    pub insecure: bool,
-    pub speedtest: bool,
-    pub show_info: bool,
-    pub log_dir: PathBuf,
-    #[allow(dead_code)]
-    pub config: &'a AppConfig,
-}
-
-pub trait HttpTester {
-    fn run_tests(
-        &self,
-        config_file: &Path,
-        urls: &[String],
-        cfg: &TestConfig,
-    ) -> Result<Vec<LiveResult>>;
-}
+use vpn_core::http_tester::{HttpTester, LiveResult, TestConfig};
 
 pub struct XrayKnifeHttpTester;
 
@@ -80,7 +52,10 @@ impl HttpTester for XrayKnifeHttpTester {
                                 url,
                                 success: false,
                                 live_file_path: None,
-                                error: Some(format!("Ошибка перемещения файла: {}", e)),
+                                error: Some(l10n::t_fmt(
+                                    "http_tester.file_move_error",
+                                    &[&e.to_string()],
+                                )),
                             }
                         } else {
                             LiveResult {
@@ -95,7 +70,7 @@ impl HttpTester for XrayKnifeHttpTester {
                         url,
                         success: false,
                         live_file_path: None,
-                        error: Some("Пустой результат теста".into()),
+                        error: Some(l10n::t("http_tester.empty_result")),
                     },
                     Err(e) => LiveResult {
                         url,
@@ -117,7 +92,10 @@ impl HttpTester for XrayKnifeHttpTester {
                         url: "unknown".into(),
                         success: false,
                         live_file_path: None,
-                        error: Some(format!("Поток HTTP-теста упал: {:?}", panic)),
+                        error: Some(l10n::t_fmt(
+                            "http_tester.thread_panic",
+                            &[&format!("{:?}", panic)],
+                        )),
                     });
                 }
             }

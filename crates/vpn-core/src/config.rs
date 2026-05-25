@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,6 @@ pub struct AppConfig {
     pub auto_menu_update_enabled: bool,
     pub auto_menu_update_interval: u64,
 
-    // Параллелизация и гео-балансировка
     pub parallel_enabled: bool,
     pub parallel_geo_balancing: bool,
     pub parallel_geo_cache_ttl: u64,
@@ -97,7 +96,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn load_or_default(path: &Path) -> Result<Self> {
+    pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
             let content = fs::read_to_string(path)?;
             serde_json::from_str(&content).context("Ошибка парсинга config.json")
@@ -109,7 +108,7 @@ impl AppConfig {
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
         Ok(())
