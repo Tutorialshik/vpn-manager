@@ -1,11 +1,10 @@
 use crate::geo;
 use crate::l10n;
-use anyhow::Context;
+use anyhow::{Context, Result};
 use chrono::Local;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::fs;
-// use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use vpn_core::config::AppConfig;
@@ -15,6 +14,7 @@ use vpn_subs::crud;
 use vpn_subs::update as subs_update;
 
 /// Координирует обновление одной или нескольких подписок, вызывает vpn-subs
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn handle_update(
     target: &str,
@@ -26,7 +26,7 @@ pub fn handle_update(
     subs_path: &Path,
     db: Option<&Connection>,
     tester: &dyn HttpTester,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let subs = crud::load_subs(subs_path)?;
     let ids = if target == "all" {
         subs.iter().map(|s| s.id).collect()
@@ -56,7 +56,7 @@ fn update_single(
     config: &AppConfig,
     db: Option<&Connection>,
     tester: &dyn HttpTester,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     println!(
         "{}",
         l10n::t_fmt("subs.update_started", &[&sub.id.to_string(), &sub.name])
@@ -65,11 +65,9 @@ fn update_single(
         .context(l10n::t("proxy.config_dir_missing"))?
         .join("vpn-manager");
 
-    // 1. Загрузка через vpn-subs (теперь внутри update_single_sub)
     let live_files =
         subs_update::update_single_sub(sub, proto, limit, keep_raw, show_info, config, tester)?;
 
-    // 2. Сохранение результатов (слияние, запись в файлы)
     let merged = format!("/tmp/vpn-sub-{}-live-merged.txt", sub.id);
     utils::merge_files(&live_files, &merged)?;
     let dest = config_dir.join(format!("sub_{}_live.txt", sub.id));
@@ -77,13 +75,11 @@ fn update_single(
     let ts = Local::now().format("%Y-%m-%d %H:%M").to_string();
     fs::write(config_dir.join(format!("sub_{}_timestamp.txt", sub.id)), ts)?;
 
-    // 3. Статистика (если есть БД)
     if let Some(conn) = db {
         let active_urls = utils::get_active_urls(config);
         record_stats(sub.id, &active_urls, config, conn)?;
     }
 
-    // 4. Обновление all_live и классификация
     let mut all_live_content = String::new();
     for entry in fs::read_dir(&config_dir)? {
         let entry = entry?;
@@ -101,7 +97,6 @@ fn update_single(
     classify_configs(&all_live, config)?;
 
     if !keep_raw {
-        // Удаляем временные файлы (можно оставить, но пока уберём)
         let _ = fs::remove_file(format!("/tmp/vpn-sub-{}-raw.txt", sub.id));
         let _ = fs::remove_file(format!("/tmp/vpn-sub-{}-filtered.txt", sub.id));
         let _ = fs::remove_file(&merged);
@@ -122,7 +117,7 @@ fn record_stats(
     urls: &[String],
     config: &AppConfig,
     conn: &Connection,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let log_dir = PathBuf::from(&config.http_log_dir);
     let tx = conn.unchecked_transaction()?;
     for url in urls {
@@ -141,7 +136,7 @@ fn record_stats(
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            if line.find("://").is_some() {
+            if line.contains("://") {
                 let link = line[..line.find(' ').unwrap_or(line.len())].to_string();
                 let hash = format!("{:x}", Sha256::digest(link.as_bytes()));
                 let host = url::Url::parse(url)
@@ -159,7 +154,13 @@ fn record_stats(
                      avg_bandwidth_mbps = (avg_bandwidth_mbps * success_count + ?4) / (success_count + 1),
                      score = ?5,
                      last_used = strftime('%s','now')",
-                    rusqlite::params![host, hash, latency.unwrap_or(999.0), bandwidth.unwrap_or(0.0), score],
+                    rusqlite::params![
+                        host,
+                        hash,
+                        latency.unwrap_or(999.0),
+                        bandwidth.unwrap_or(0.0),
+                        score
+                    ],
                 )?;
             }
         }
@@ -192,12 +193,12 @@ fn calculate_score(latency: Option<f64>, bandwidth: Option<f64>, strategy: &str)
     }
 }
 
-pub(crate) fn sanitize_filename(s: &str) -> String {
+fn sanitize_filename(s: &str) -> String {
     s.replace(['/', ':', '?', '&'], "_")
 }
 
 /// Классификация конфигов по странам
-fn classify_configs(input_path: &Path, config: &AppConfig) -> anyhow::Result<()> {
+fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
     let config_dir = dirs::config_dir()
         .context(l10n::t("proxy.config_dir_missing"))?
         .join("vpn-manager");
@@ -296,26 +297,29 @@ mod tests {
     fn test_record_stats() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let log_dir = dir.path();
-        // Используем ту же sanitize_filename, что и record_stats
-        let sanitized = sanitize_filename("https://test.com");
-        let log_file = log_dir.join(format!("vpn-http-1-{}.log", sanitized));
+        // Создаём лог-файл с одной строкой, похожей на вывод xray-knife http
+        let test_url = "https://test.com";
+        let filename = format!("vpn-http-1-{}.log", sanitize_filename(test_url));
+        let log_file = log_dir.join(&filename);
         std::fs::write(
             &log_file,
-            "https://test.com Delay: 150ms Speed: 50.0 Mbps\n",
+            "https://test.com 200 Delay: 150ms Speed: 50.0 Mbps\n",
         )?;
 
         let mut config = AppConfig::default();
-        config.http_log_dir = log_dir.to_str().unwrap().to_string();
+        config.http_log_dir = log_dir.to_string_lossy().into();
 
         let conn = setup_db();
-        let urls = vec!["https://test.com".to_string()];
+        let urls = vec![test_url.to_string()];
 
+        // Вызываем record_stats
         record_stats(1, &urls, &config, &conn)?;
 
+        // Проверяем, что запись появилась
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM profile_host_stats", [], |row| {
             row.get(0)
         })?;
-        assert_eq!(count, 1);
+        assert_eq!(count, 1, "record_stats не добавила запись");
 
         Ok(())
     }

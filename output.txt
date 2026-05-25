@@ -1,0 +1,3384 @@
+=== ./src/db.rs ===
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
+use std::path::Path;
+
+/// Открыть или создать БД и включить WAL
+pub fn open_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).context("Не удалось открыть БД SQLite")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    create_tables(&conn)?;
+    Ok(conn)
+}
+
+fn create_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS profile_host_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host TEXT NOT NULL,
+            profile_link_hash TEXT NOT NULL,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            avg_latency_ms REAL,
+            avg_bandwidth_mbps REAL,
+            last_used INTEGER,
+            score REAL,
+            UNIQUE(host, profile_link_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS host_country_cache (
+            host TEXT PRIMARY KEY,
+            country TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn cache_host_country(conn: &Connection, host: &str, country: &str) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT OR REPLACE INTO host_country_cache (host, country, updated_at) VALUES (?1, ?2, ?3)",
+        params![host, country, now],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn get_cached_country(conn: &Connection, host: &str, ttl: u64) -> Option<String> {
+    let now = chrono::Utc::now().timestamp();
+    let mut stmt = conn
+        .prepare("SELECT country, updated_at FROM host_country_cache WHERE host = ?1")
+        .ok()?;
+    let row = stmt
+        .query_row(params![host], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()?;
+    let (country, updated_at) = row;
+    if (now - updated_at) < ttl as i64 {
+        Some(country)
+    } else {
+        None
+    }
+}
+
+=== ./src/geo.rs ===
+use std::net::ToSocketAddrs;
+use std::process::Command;
+
+pub fn country_code(ip: &str, db_path: &str) -> Option<String> {
+    let output = Command::new("mmdblookup")
+        .args(["--file", db_path, "--ip", ip, "country", "iso_code"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find(|l| l.contains("utf8_string"))
+            .and_then(|l| l.split('"').nth(3).map(|s| s.to_string()))
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+pub fn country_name(ip: &str, db_path: &str) -> Option<String> {
+    let output = Command::new("mmdblookup")
+        .args(["--file", db_path, "--ip", ip, "country", "names", "en"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find(|l| l.contains("utf8_string"))
+            .and_then(|l| l.split('"').nth(3).map(|s| s.to_string()))
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+pub fn get_host_country(
+    host: &str,
+    conn: &rusqlite::Connection,
+    geoip_db_path: &str,
+    cache_ttl: u64,
+) -> Option<String> {
+    if let Some(cached) = crate::db::get_cached_country(conn, host, cache_ttl) {
+        return Some(cached);
+    }
+
+    let ip = resolve_host_to_ip(host)?;
+    let country = country_code(&ip, geoip_db_path)?;
+    crate::db::cache_host_country(conn, host, &country).ok();
+    Some(country)
+}
+
+#[allow(dead_code)]
+fn resolve_host_to_ip(host: &str) -> Option<String> {
+    (host, 0)
+        .to_socket_addrs()
+        .ok()?
+        .next()
+        .map(|addr| addr.ip().to_string())
+}
+
+=== ./src/localization.rs ===
+pub const MSG_ERR_CONFIG_DIR: &str = "Не удалось определить конфигурационную директорию";
+pub const MSG_ERR_CREATE_CONFIG_DIR: &str = "Не удалось создать директорию конфига";
+pub const MSG_ERR_PARSE_CONFIG: &str = "Ошибка парсинга config.json";
+pub const MSG_ERR_PARSE_COMMANDS: &str = "Ошибка парсинга commands.json";
+pub const MSG_ERR_PARSE_PARALLEL: &str = "Ошибка парсинга parallel_rules.json";
+pub const MSG_ERR_PARSE_SUBS: &str = "Неверный формат subscriptions.json";
+pub const MSG_ERR_XRAY_FETCH: &str = "Не удалось запустить xray-knife subs fetch";
+pub const MSG_ERR_XRAY_FETCH_FAIL: &str = "xray-knife subs fetch завершился с ошибкой (код {})";
+pub const MSG_ERR_XRAY_PROXY: &str = "Не удалось запустить xray-knife proxy";
+pub const MSG_ERR_XRAY_SPAWN: &str = "Не удалось запустить xray-knife";
+pub const MSG_ERR_XRAY_HTTP_FAIL: &str = "xray-knife http завершился с ошибкой";
+pub const MSG_ERR_XRAY_HTTP_EMPTY: &str = "Пустой результат теста";
+pub const MSG_ERR_XRAY_HTTP_PANIC: &str = "Поток HTTP-теста упал";
+pub const MSG_ERR_ACTIVE_URLS: &str = "Нет активных тестовых URL";
+pub const MSG_ERR_NO_LIVE_CONFIGS: &str = "Нет живых конфигов";
+pub const MSG_ERR_UNKNOWN_SOURCE: &str = "Неизвестный источник: {}";
+pub const MSG_ERR_SUB_NOT_FOUND: &str = "Подписка {} не найдена";
+pub const MSG_ERR_SUB_REGION_NOT_FOUND: &str = "Файл региона {} не найден";
+pub const MSG_ERR_SUB_REGION_EMPTY: &str = "Файл региона {} не найден или пуст";
+pub const MSG_ERR_SUB_UPDATE_FIRST: &str = "Сначала обновите подписку {}";
+pub const MSG_ERR_SUB_LIVE_NOT_FOUND: &str = "Сначала update {}";
+pub const MSG_ERR_SUB_CFS_NO_CONFIGS: &str = "Нет живых конфигов для подписки {}. Сначала выполните subs update {}";
+pub const MSG_ERR_UNKNOWN_TARGET: &str = "Неизвестная цель: {}";
+pub const MSG_ERR_PROXY_NOT_RUNNING: &str = "Прокси не запущен. Сначала выполните start.";
+pub const MSG_ERR_PROXY_FILE_NOT_FOUND: &str = "Файл конфигов не найден: {}";
+pub const MSG_ERR_PROXY_EMPTY_LIST: &str = "Список профилей пуст";
+pub const MSG_ERR_PROXY_UNEXPECTED_EXIT: &str = "Процесс xray-knife proxy неожиданно завершился (код {}). Проверьте лог: {}";
+pub const MSG_ERR_PROXY_CHECK_ERROR: &str = "Ошибка при проверке процесса: {}";
+pub const MSG_ERR_EXPAND_RANGE: &str = "неверный диапазон: {}";
+pub const MSG_ERR_EXPAND_START_GT_END: &str = "начало диапазона больше конца: {}-{}";
+pub const MSG_ERR_CMD_HELP: &str = "Не загружены описания команд. Используйте --help";
+pub const MSG_INFO_PROXY_STOPPED: &str = "✅ Прокси остановлен (PID {})";
+pub const MSG_INFO_PROXY_CHANGED: &str = "✅ Профиль изменён";
+pub const MSG_INFO_SUB_ADDED: &str = "✅ Подписка добавлена";
+pub const MSG_INFO_SUB_EDITED: &str = "✅ Подписка изменена";
+pub const MSG_INFO_SUB_REMOVED: &str = "✅ Удалено подписок: {}";
+pub const MSG_INFO_SUB_SWITCHED_ON: &str = "✅ Подписки включены: {}";
+pub const MSG_INFO_SUB_SWITCHED_OFF: &str = "✅ Подписки выключены: {}";
+pub const MSG_INFO_SUB_UPDATED: &str = "✅ Подписка [{}] обновлена";
+pub const MSG_INFO_SETTING_PORT: &str = "Порт: {}";
+pub const MSG_INFO_SETTING_IP: &str = "IP прослушивания: {}";
+pub const MSG_INFO_SETTING_PROTO: &str = "Протокол: {}";
+pub const MSG_INFO_SETTING_METHOD: &str = "Метод выбора: {}";
+pub const MSG_INFO_SETTING_MODE: &str = "Режим: {}";
+pub const MSG_INFO_SETTING_CORE: &str = "Ядро: {}";
+pub const MSG_INFO_SETTING_ROTATE: &str = "Ротация: {}с";
+pub const MSG_INFO_SETTING_INSECURE: &str = "Insecure: {}";
+pub const MSG_INFO_SETTING_SPEEDTEST: &str = "Speedtest: {}";
+pub const MSG_INFO_SETTING_HTTP_VERBOSE: &str = "HTTP verbose: {}";
+pub const MSG_INFO_SETTING_SHOW_UPDATE_INFO: &str = "Показывать инфо при обновлении: {}";
+pub const MSG_INFO_SETTING_PARALLEL: &str = "Параллельных тестов: {}";
+pub const MSG_INFO_SETTING_BLACKLIST_DUR: &str = "Блэклист: {} с";
+pub const MSG_INFO_SETTING_BLACKLIST_STRIKES: &str = "Ошибок до блэклиста: {}";
+pub const MSG_INFO_SETTING_AUTOUPDATE: &str = "Автообновление: {} мин для {}";
+pub const MSG_INFO_SETTING_AUTOMENU: &str = "Автообновление меню: {}";
+pub const MSG_INFO_SETTING_RESET: &str = "✅ Сброшено на умолчания";
+pub const MSG_INFO_HELP_START: &str = "═════════════════ start – запуск прокси ═════════════════";
+pub const MSG_INFO_HELP_FLAGS: &str = " -m, --method <random|fastest> метод выбора\n -r, --rotate <S> интервал ротации\n все флаги xray-knife proxy также принимаются";
+pub const MSG_INFO_HELP_REGIONS_HEADER: &str = "Регионы:";
+pub const MSG_INFO_HELP_SUBS_HEADER: &str = "Подписки:";
+pub const MSG_INFO_HELP_SEPARATOR: &str = "════════════════════════════════════════════════════════";
+pub const MSG_STATUS_HEADER: &str = "═══════════════════ Состояние ═══════════════════";
+pub const MSG_STATUS_PORT: &str = "  Порт:            {}";
+pub const MSG_STATUS_REGION: &str = "  Регион:          {}";
+pub const MSG_STATUS_MODE: &str = "  Режим:           {}";
+pub const MSG_STATUS_CORE: &str = "  Ядро:            {}";
+pub const MSG_STATUS_ROTATE: &str = "  Ротация:         {} с";
+pub const MSG_STATUS_INSECURE: &str = "  Insecure:        {}";
+pub const MSG_STATUS_SPEEDTEST: &str = "  Speedtest:       {}";
+pub const MSG_STATUS_HTTP_VERBOSE: &str = "  HTTP verbose:    {}";
+pub const MSG_STATUS_PROXY_STATE: &str = "  Прокси:          {}{}\x1b[0m";
+pub const MSG_STATUS_CURRENT_SERVER: &str = "  Текущий сервер:  {} {} ({})";
+pub const MSG_STATUS_CURRENT_IP: &str = "  IP:              {} (протокол: {})";
+pub const MSG_CLASSIFICATION_DONE: &str = "🌍 Классификация завершена: {} обработано, {} пропущено";
+pub const MSG_UPDATE_START: &str = "ℹ️ Обновление [{}] {}";
+pub const MSG_NO_SUBS: &str = "Нет подписок";
+pub const MSG_SUBS_LIST_HEADER: &str = "═══════════════════════ Подписки ═══════════════════════";
+pub const MSG_SUBS_LIST_COLS: &str = " {:<4} {:<20} {:>2} {:>6} {:>12} {:<30} {:>12}";
+pub const MSG_SUBS_COMMANDS_HELP: &str = r"Команды subs:
+ list показать список (по умолчанию)
+ add добавить подписку
+ edit <ID> изменить подписку
+ remove <IDs> удалить (all, 1,2-4, 1,3,5)
+ update <IDs> [-i] [-p proto] [-l N] [-k on|off] [-x]
+ switch on/off <IDs> включить/выключить
+ cfscanner [--sub-id ID] [флаги]";
+pub const MSG_SETTINGS_SHOW_CURRENT: &str = "Текущие настройки:";
+pub const MSG_SETTINGS_PORT: &str = "  Порт:            {}";
+pub const MSG_SETTINGS_IP: &str = "  IP:              {}";
+pub const MSG_SETTINGS_PROTO: &str = "  Протокол:        {}";
+pub const MSG_SETTINGS_METHOD: &str = "  Метод:           {}";
+pub const MSG_SETTINGS_MODE: &str = "  Режим:           {}";
+pub const MSG_SETTINGS_CORE: &str = "  Ядро:            {}";
+pub const MSG_SETTINGS_ROTATE: &str = "  Ротация:         {} с";
+pub const MSG_SETTINGS_INSECURE: &str = "  Insecure:        {}";
+pub const MSG_SETTINGS_SPEEDTEST: &str = "  Speedtest:       {}";
+pub const MSG_SETTINGS_HTTP_VERBOSE: &str = "  HTTP verbose:    {}";
+pub const MSG_SETTINGS_SHOW_UPDATE_INFO: &str = "  Показ инфо при обн.: {}";
+pub const MSG_SETTINGS_PARALLEL: &str = "  Параллельные тесты: {}";
+pub const MSG_SETTINGS_BLACKLIST: &str = "  Блэклист:        ошибок {}, длит. {} с";
+pub const MSG_SETTINGS_AUTOUPDATE: &str = "  Автообновление:  {} мин, IDs: {}";
+pub const MSG_SETTINGS_AUTOMENU: &str = "  Автообновление меню: {}";
+pub const MSG_SETTINGS_ACTIVE_URLS: &str = "  Активные URL:    {}";
+pub const MSG_HTTP_URLS_SHOW: &str = "Пул тестовых URL:";
+pub const MSG_HTTP_URLS_ACTIVATED: &str = "✅ Активные URL обновлены";
+pub const MSG_HTTP_URLS_EMPTY: &str = "Нет активных тестовых URL";
+pub const MSG_ADD_SUB_ID_HINT: &str = "Автоматический ID: {}";
+pub const MSG_ADD_SUB_URL_PROMPT: &str = "URL подписки: ";
+pub const MSG_ADD_SUB_NAME_PROMPT: &str = "Имя подписки: ";
+pub const MSG_EDIT_SUB_CURRENT: &str = "Текущие данные: ID={}, Имя={}, URL={}";
+pub const MSG_EDIT_SUB_NAME_PROMPT: &str = "Новое имя (Enter = оставить): ";
+pub const MSG_EDIT_SUB_URL_PROMPT: &str = "Новый URL (Enter = оставить): ";
+pub const MSG_WARN_HTTP_ERROR: &str = "⚠️ Ошибка HTTP теста: {}";
+pub const MSG_WARN_HTTP_PANIC: &str = "⚠️ Поток HTTP теста упал: {:?}";
+pub const MSG_WARN_SUB_NOT_FOUND: &str = "⚠️ Подписка {} не найдена";
+pub const MSG_WARN_HTTP_TEST_ERROR_URL: &str = "⚠️ Ошибка HTTP теста для {}: {}";
+pub const MSG_PROXY_RUNNING: &str = "запущен";
+pub const MSG_PROXY_NOT_RUNNING: &str = "не запущен";
+pub const MSG_COLOR_GREEN: &str = "\x1b[32m";
+pub const MSG_COLOR_RED: &str = "\x1b[31m";
+pub const MSG_COLOR_RESET: &str = "\x1b[0m";
+
+=== ./src/l10n.rs ===
+use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+static TRANSLATIONS: Lazy<Mutex<Option<Value>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn init(locale_path: &PathBuf) -> Result<()> {
+    let content =
+        fs::read_to_string(locale_path).context("Не удалось прочитать файл локализации")?;
+    let v: Value = serde_json::from_str(&content).context("Ошибка парсинга локализации")?;
+    let mut store = TRANSLATIONS.lock().unwrap();
+    *store = Some(v);
+    Ok(())
+}
+
+pub fn t(key: &str) -> String {
+    let store = TRANSLATIONS.lock().unwrap();
+    let val = store.as_ref().and_then(|v| {
+        let parts: Vec<&str> = key.split('.').collect();
+        let mut current = v;
+        for part in parts {
+            match current.get(part) {
+                Some(v) => current = v,
+                None => return None,
+            }
+        }
+        current.as_str().map(|s| s.to_owned())
+    });
+    val.unwrap_or_else(|| key.to_string())
+}
+
+/// Форматирует переведённую строку с подстановкой позиционных аргументов {0}, {1}...
+pub fn t_fmt(key: &str, args: &[&str]) -> String {
+    let template = t(key);
+    let mut result = template;
+    for (i, arg) in args.iter().enumerate() {
+        result = result.replace(&format!("{{{}}}", i), arg);
+    }
+    result
+}
+
+#[macro_export]
+macro_rules! t {
+    ($key:expr) => {
+        $crate::l10n::t($key)
+    };
+}
+
+=== ./src/settings.rs ===
+use crate::l10n;
+use anyhow::{bail, Result};
+use std::path::Path;
+use vpn_core::config::AppConfig;
+
+pub fn handle_settings(
+    setting: Option<super::SettingsCmd>,
+    config: &mut AppConfig,
+    config_path: &Path,
+    _subs_path: &Path,
+) -> Result<()> {
+    match setting {
+        Some(super::SettingsCmd::Port { value }) => {
+            config.default_port = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.port_saved", &[&value.to_string()]),
+            )?;
+        }
+        Some(super::SettingsCmd::Ip { value }) => {
+            config.listen_ip = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.ip_saved", &[&config.listen_ip]),
+            )?;
+        }
+        Some(super::SettingsCmd::Proto { value }) => {
+            config.last_inbound_proto = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.proto_saved", &[&config.last_inbound_proto]),
+            )?;
+        }
+        Some(super::SettingsCmd::Method { value }) => {
+            if value != "random" && value != "fastest" {
+                bail!(l10n::t("settings.invalid_method"));
+            }
+            config.select_mode = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.method_saved", &[&config.select_mode]),
+            )?;
+        }
+        Some(super::SettingsCmd::Mode { value }) => {
+            config.last_mode_type = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.mode_saved", &[&config.last_mode_type]),
+            )?;
+        }
+        Some(super::SettingsCmd::Core { value }) => {
+            config.core = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.core_saved", &[&config.core]),
+            )?;
+        }
+        Some(super::SettingsCmd::Rotate { seconds }) => {
+            config.rotate = seconds;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.rotate_saved", &[&seconds.to_string()]),
+            )?;
+        }
+        Some(super::SettingsCmd::Insecure { on }) => {
+            config.insecure = on;
+            let state = if on {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            };
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.insecure_saved", &[&state]),
+            )?;
+        }
+        Some(super::SettingsCmd::Speedtest { on }) => {
+            config.speedtest = on;
+            let state = if on {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            };
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.speedtest_saved", &[&state]),
+            )?;
+        }
+        Some(super::SettingsCmd::HttpVerbose { on }) => {
+            config.http_verbose = on;
+            let state = if on {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            };
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.http_verbose_saved", &[&state]),
+            )?;
+        }
+        Some(super::SettingsCmd::Info { on }) => {
+            config.show_update_info = on;
+            let state = if on {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            };
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.show_info_saved", &[&state]),
+            )?;
+        }
+        Some(super::SettingsCmd::Parallel { value }) => {
+            config.parallel_tests = value;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.parallel_saved", &[&value.to_string()]),
+            )?;
+        }
+        Some(super::SettingsCmd::HttpUrls(cmd)) => {
+            handle_http_urls(cmd, config, config_path)?;
+        }
+        Some(super::SettingsCmd::BlacklistDuration { seconds }) => {
+            config.blacklist_duration = seconds;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.blacklist_duration_saved", &[&seconds.to_string()]),
+            )?;
+        }
+        Some(super::SettingsCmd::BlacklistStrikes { strikes }) => {
+            config.blacklist_strikes = strikes;
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.blacklist_strikes_saved", &[&strikes.to_string()]),
+            )?;
+        }
+        Some(super::SettingsCmd::AutoUpdate { interval_min, ids }) => {
+            config.auto_update_interval = interval_min;
+            config.auto_update_ids = ids.unwrap_or_else(|| "all".into());
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt(
+                    "settings.auto_update_saved",
+                    &[
+                        &config.auto_update_interval.to_string(),
+                        &config.auto_update_ids,
+                    ],
+                ),
+            )?;
+        }
+        Some(super::SettingsCmd::AutoMenuUpdate {
+            enable,
+            interval_sec,
+        }) => {
+            config.auto_menu_update_enabled = enable;
+            config.auto_menu_update_interval = interval_sec;
+            let status = if enable {
+                format!("включено, интервал {} с", interval_sec)
+            } else {
+                "выключено".into()
+            };
+            save_and_log(
+                config,
+                config_path,
+                &l10n::t_fmt("settings.auto_menu_update_saved", &[&status]),
+            )?;
+        }
+        Some(super::SettingsCmd::Reset) => {
+            *config = AppConfig::default();
+            config.save(config_path)?;
+            println!("{}", l10n::t("settings.reset"));
+        }
+        None => {
+            show_current_settings(config);
+        }
+    }
+    Ok(())
+}
+
+fn save_and_log(config: &mut AppConfig, path: &Path, msg: &str) -> Result<()> {
+    config.save(path)?;
+    println!("{}", l10n::t_fmt("settings.saved", &[msg]));
+    Ok(())
+}
+
+fn show_current_settings(config: &AppConfig) {
+    println!("{}", l10n::t("settings.current_title"));
+    println!(
+        "{}",
+        l10n::t_fmt("settings.port", &[&config.default_port.to_string()])
+    );
+    println!("{}", l10n::t_fmt("settings.ip", &[&config.listen_ip]));
+    println!(
+        "{}",
+        l10n::t_fmt("settings.proto", &[&config.last_inbound_proto])
+    );
+    println!("{}", l10n::t_fmt("settings.method", &[&config.select_mode]));
+    println!(
+        "{}",
+        l10n::t_fmt("settings.mode", &[&config.last_mode_type])
+    );
+    println!("{}", l10n::t_fmt("settings.core", &[&config.core]));
+    println!(
+        "{}",
+        l10n::t_fmt("settings.rotate", &[&config.rotate.to_string()])
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.insecure",
+            &[if config.insecure {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.speedtest",
+            &[if config.speedtest {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.http_verbose",
+            &[if config.http_verbose {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.show_info",
+            &[if config.show_update_info {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.parallel_tests",
+            &[&config.parallel_tests.to_string()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.blacklist",
+            &[
+                &config.blacklist_strikes.to_string(),
+                &config.blacklist_duration.to_string()
+            ]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "settings.auto_update",
+            &[
+                &config.auto_update_interval.to_string(),
+                &config.auto_update_ids
+            ]
+        )
+    );
+    let auto_menu = if config.auto_menu_update_enabled {
+        format!("{} с", config.auto_menu_update_interval)
+    } else {
+        l10n::t("common.no")
+    };
+    println!(
+        "{}",
+        l10n::t_fmt("settings.auto_menu_update", &[&auto_menu])
+    );
+    println!(
+        "{}",
+        l10n::t_fmt("settings.active_urls", &[&config.http_url_active_ids])
+    );
+}
+
+fn handle_http_urls(
+    cmd: super::HttpUrlsCmd,
+    config: &mut AppConfig,
+    config_path: &Path,
+) -> Result<()> {
+    match cmd {
+        super::HttpUrlsCmd::Show => {
+            println!("Пул тестовых URL (в разработке)");
+        }
+        super::HttpUrlsCmd::Add { url: _ } => {}
+        super::HttpUrlsCmd::Remove { id: _ } => {}
+        super::HttpUrlsCmd::Activate { ids } => {
+            config.http_url_active_ids = ids;
+            config.save(config_path)?;
+            println!(
+                "{}",
+                l10n::t_fmt("settings.saved", &["Активные URL обновлены"])
+            );
+        }
+        super::HttpUrlsCmd::Deactivate { ids: _ } => {}
+    }
+    Ok(())
+}
+
+=== ./src/commands.rs ===
+use crate::l10n;
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct CommandsHelp {
+    pub update: CommandHelp,
+    pub start: CommandHelp,
+    #[serde(rename = "_global_help")]
+    pub global_help: GlobalHelp,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct CommandHelp {
+    pub summary: String,
+    pub usage: Option<String>,
+    pub flags: Option<HashMap<String, String>>,
+    pub regions: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GlobalHelp {
+    pub description: String,
+    pub commands: HashMap<String, String>,
+}
+
+impl GlobalHelp {
+    pub fn global_usage(&self) -> String {
+        let mut out = format!("{}\n\n", self.description);
+        for (cmd, desc) in &self.commands {
+            if desc.is_empty() {
+                out.push_str(&format!("{}\n", cmd));
+            } else {
+                out.push_str(&format!("  {:12} - {}\n", cmd, desc));
+            }
+        }
+        out
+    }
+}
+
+pub fn load_commands(path: &Path) -> Result<CommandsHelp> {
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content).context(l10n::t("commands.parse_error"))
+}
+
+=== ./src/main.rs ===
+mod commands;
+mod db;
+mod geo;
+mod l10n;
+mod proxy;
+mod settings;
+mod subs;
+mod update;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
+use vpn_core::config::AppConfig;
+use vpn_testing::XrayKnifeHttpTester;
+
+#[derive(Parser)]
+#[command(
+    name = "vpn-manager",
+    version,
+    about = "Управление VPN подписками и прокси"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    #[command(about = "Запуск прокси")]
+    Start {
+        #[arg(short = 'm', long = "method")]
+        method: Option<String>,
+
+        #[arg(short = 'r', long = "rotate")]
+        rotate: Option<u64>,
+
+        /// Цель и дополнительные аргументы (menu, now, region <регион>, sub <ID>, exec <команда...>)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+    #[command(about = "Остановка прокси")]
+    Stop,
+    #[command(about = "Перезапуск последнего профиля")]
+    Restart,
+    #[command(about = "Сменить профиль не прерывая сессию")]
+    Change {
+        #[command(subcommand)]
+        action: Option<ChangeCmd>,
+    },
+    #[command(about = "Управление подписками")]
+    Subs {
+        #[command(subcommand)]
+        action: Option<SubsCmd>,
+    },
+    #[command(about = "Изменение настроек")]
+    Settings {
+        #[command(subcommand)]
+        setting: Option<SettingsCmd>,
+    },
+    #[command(about = "Показать состояние")]
+    Status,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ChangeCmd {
+    Next,
+    Prev,
+    Random,
+    Fastest,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum SubsCmd {
+    List,
+    Add,
+    Edit {
+        id: usize,
+    },
+    Remove {
+        ids: String,
+    },
+    Update {
+        #[arg(required = false)]
+        target: Option<String>,
+        #[arg(short = 'i', long = "info")]
+        info: bool,
+        #[arg(short = 'p', long = "protocol", default_value_t = String::from("all"))]
+        protocol: String,
+        #[arg(short = 'l', long = "limit", default_value_t = 0)]
+        limit: usize,
+        #[arg(short = 'k', long = "keep-raw", default_value_t = true)]
+        keep_raw: bool,
+        #[arg(short = 'x', long = "via-proxy", default_value_t = false)]
+        via_proxy: bool,
+    },
+    Switch {
+        #[command(subcommand)]
+        action: SwitchCmd,
+    },
+    Cfscanner {
+        #[arg(long = "sub-id")]
+        sub_id: Option<usize>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum SwitchCmd {
+    On { ids: String },
+    Off { ids: String },
+}
+
+#[derive(Subcommand)]
+pub enum SettingsCmd {
+    Port {
+        value: u16,
+    },
+    Ip {
+        value: String,
+    },
+    Proto {
+        value: String,
+    },
+    Method {
+        value: String,
+    },
+    Mode {
+        value: String,
+    },
+    Core {
+        value: String,
+    },
+    Rotate {
+        seconds: u64,
+    },
+    Insecure {
+        on: bool,
+    },
+    Speedtest {
+        on: bool,
+    },
+    HttpVerbose {
+        on: bool,
+    },
+    Info {
+        on: bool,
+    },
+    Parallel {
+        value: usize,
+    },
+    #[command(subcommand)]
+    HttpUrls(HttpUrlsCmd),
+    BlacklistDuration {
+        seconds: u64,
+    },
+    BlacklistStrikes {
+        strikes: u32,
+    },
+    AutoUpdate {
+        interval_min: u64,
+        ids: Option<String>,
+    },
+    AutoMenuUpdate {
+        #[arg(short = 'e', long = "enable")]
+        enable: bool,
+        interval_sec: u64,
+    },
+    Reset,
+}
+
+#[derive(Subcommand)]
+pub enum HttpUrlsCmd {
+    Show,
+    Add { url: String },
+    Remove { id: usize },
+    Activate { ids: String },
+    Deactivate { ids: String },
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+
+    // Инициализация локализации
+    let config_dir = dirs::config_dir()
+        .context(l10n::t("main.dir_missing"))?
+        .join("vpn-manager");
+    std::fs::create_dir_all(&config_dir).context(l10n::t("main.create_dir_fail"))?;
+    let locales_dir = config_dir.join("locales");
+    std::fs::create_dir_all(&locales_dir)?;
+    let locale_path = locales_dir.join("ru.json");
+    if !locale_path.exists() {
+        if let Some(embedded) = option_env!("EMBED_LOCALE_RU") {
+            std::fs::write(&locale_path, embedded)?;
+        } else {
+            let src = PathBuf::from("locales/ru.json");
+            if src.exists() {
+                std::fs::copy(&src, &locale_path)?;
+            }
+        }
+    }
+    l10n::init(&locale_path)?;
+
+    let cli = Cli::parse();
+
+    let config_path = config_dir.join("config.json");
+    let commands_path = config_dir.join("commands.json");
+    let subs_path = config_dir.join("subscriptions.json");
+
+    let mut app_config = AppConfig::load_or_default(&config_path)?;
+    let cmd_help = commands::load_commands(&commands_path).ok();
+
+    let db_path = PathBuf::from(&app_config.parallel_db_path);
+    let db = db::open_db(&db_path).ok();
+
+    match cli.command {
+        Some(Commands::Start {
+            method,
+            rotate,
+            extra_args,
+        }) => {
+            let target = if extra_args.is_empty() {
+                "menu".to_string()
+            } else {
+                extra_args[0].clone()
+            };
+            let mut proxy_args: Vec<String> = if extra_args.len() > 1 {
+                extra_args[1..].to_vec()
+            } else {
+                vec![]
+            };
+
+            if let Some(m) = method {
+                proxy_args.push("-m".into());
+                proxy_args.push(m);
+            }
+            if let Some(r) = rotate {
+                proxy_args.push("-r".into());
+                proxy_args.push(r.to_string());
+            }
+
+            let target_parsed = parse_start_target(&target, &mut proxy_args)?;
+            match target_parsed {
+                StartTarget::Menu => proxy::show_start_help(&app_config, &subs_path),
+                StartTarget::Now => {
+                    proxy::handle_start(
+                        "now",
+                        &proxy_args,
+                        &mut app_config,
+                        &config_path,
+                        &subs_path,
+                    )?;
+                }
+                StartTarget::Region { region } => {
+                    proxy::handle_start(
+                        &region,
+                        &proxy_args,
+                        &mut app_config,
+                        &config_path,
+                        &subs_path,
+                    )?;
+                }
+                StartTarget::Sub { id } => {
+                    proxy::handle_start(
+                        &format!("sub {}", id),
+                        &proxy_args,
+                        &mut app_config,
+                        &config_path,
+                        &subs_path,
+                    )?;
+                }
+                StartTarget::Exec { args } => {
+                    vpn_knife::run_knife("exec", &args)?;
+                }
+            }
+        }
+        Some(Commands::Stop) => proxy::stop_proxy(&app_config)?,
+        Some(Commands::Restart) => {
+            proxy::stop_proxy(&app_config)?;
+            proxy::handle_start("now", &[], &mut app_config, &config_path, &subs_path)?;
+        }
+        Some(Commands::Change { action }) => {
+            let action = action.unwrap_or(ChangeCmd::Next);
+            proxy::change_profile(action, &app_config, &subs_path)?;
+        }
+        Some(Commands::Subs { action }) => {
+            let tester = XrayKnifeHttpTester;
+            subs::handle_subs_ext(action, &subs_path, &app_config, db.as_ref(), &tester)?;
+        }
+        Some(Commands::Settings { setting }) => {
+            settings::handle_settings(setting, &mut app_config, &config_path, &subs_path)?;
+        }
+        Some(Commands::Status) => {
+            status(&app_config, &subs_path, db.as_ref())?;
+        }
+        None => {
+            if let Some(help) = cmd_help {
+                println!("{}", help.global_help.global_usage());
+            } else {
+                println!("{}", l10n::t("main.no_help"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum StartTarget {
+    Menu,
+    Now,
+    Region { region: String },
+    Sub { id: usize },
+    Exec { args: Vec<String> },
+}
+
+fn parse_start_target(target: &str, proxy_args: &mut Vec<String>) -> Result<StartTarget> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || trimmed == "menu" {
+        Ok(StartTarget::Menu)
+    } else if trimmed == "now" {
+        Ok(StartTarget::Now)
+    } else if trimmed == "region" {
+        if proxy_args.is_empty() {
+            Err(anyhow::anyhow!(l10n::t_fmt(
+                "proxy.unknown_target",
+                &[target]
+            )))
+        } else {
+            let region = proxy_args.remove(0);
+            Ok(StartTarget::Region { region })
+        }
+    } else if trimmed == "sub" {
+        if proxy_args.is_empty() {
+            Err(anyhow::anyhow!(l10n::t_fmt(
+                "proxy.unknown_target",
+                &[target]
+            )))
+        } else {
+            let id: usize = proxy_args.remove(0).parse()?;
+            Ok(StartTarget::Sub { id })
+        }
+    } else if trimmed == "exec" {
+        let args = std::mem::take(proxy_args);
+        Ok(StartTarget::Exec { args })
+    } else if vpn_core::utils::resolve_region(trimmed).is_some() {
+        Ok(StartTarget::Region {
+            region: trimmed.to_owned(),
+        })
+    } else {
+        Err(anyhow::anyhow!(l10n::t_fmt(
+            "proxy.unknown_target",
+            &[target]
+        )))
+    }
+}
+
+fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>) -> Result<()> {
+    let running = proxy::is_running(app);
+    let (status_text, color) = if running {
+        (l10n::t("status.running"), "\x1b[32m")
+    } else {
+        (l10n::t("status.not_running"), "\x1b[31m")
+    };
+    println!("{}", l10n::t("status.title"));
+    println!(
+        "{}",
+        l10n::t_fmt("status.port", &[&app.default_port.to_string()])
+    );
+    println!("{}", l10n::t_fmt("status.region", &[&app.last_region]));
+    println!("{}", l10n::t_fmt("status.mode", &[&app.last_mode_type]));
+    println!("{}", l10n::t_fmt("status.core", &[&app.core]));
+    println!(
+        "{}",
+        l10n::t_fmt("status.rotate", &[&app.rotate.to_string()])
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "status.insecure",
+            &[if app.insecure {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "status.speedtest",
+            &[if app.speedtest {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "status.http_verbose",
+            &[if app.http_verbose {
+                l10n::t("common.yes")
+            } else {
+                l10n::t("common.no")
+            }
+            .as_str()]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt("status.proxy_running", &[color, &status_text])
+    );
+
+    if let Some(info) = proxy::get_current_config_info(app) {
+        println!(
+            "{}",
+            l10n::t_fmt("status.server", &[&info.flag, &info.country, &info.host])
+        );
+        println!(
+            "{}",
+            l10n::t_fmt("status.ip_proto", &[&info.ip, &info.protocol])
+        );
+    }
+
+    subs::list_subscriptions(subs_path, app);
+    Ok(())
+}
+
+=== ./src/proxy.rs ===
+use crate::l10n;
+use crate::subs;
+use anyhow::{bail, Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use vpn_core::config::AppConfig;
+use vpn_core::types::ConfigInfo;
+use vpn_core::utils;
+
+pub fn is_running(_config: &AppConfig) -> bool {
+    match pid_file_path() {
+        Ok(pid_path) => {
+            if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    unsafe { libc::kill(pid, 0) == 0 }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+fn pid_file_path() -> Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .context(l10n::t("proxy.config_dir_missing"))?
+        .join("vpn-manager");
+    Ok(dir.join("xray-knife.pid"))
+}
+
+pub fn stop_proxy(_config: &AppConfig) -> Result<()> {
+    let pid_path = pid_file_path()?;
+    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                unsafe { libc::kill(pid, 15) };
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let _ = unsafe { libc::kill(pid, 9) };
+                println!("{}", l10n::t_fmt("proxy.stopped", &[&pid.to_string()]));
+            }
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg("xray-knife proxy")
+        .status();
+    Ok(())
+}
+
+pub fn handle_start(
+    target: &str,
+    extra_args: &[String],
+    config: &mut AppConfig,
+    config_path: &Path,
+    _subs_path: &Path,
+) -> Result<()> {
+    stop_proxy(config)?;
+    let config_dir = dirs::config_dir()
+        .context(l10n::t("proxy.config_dir_missing"))?
+        .join("vpn-manager");
+
+    let (cfg_file, save_region) = match target {
+        "now" => {
+            if config.last_region.starts_with("_sub_") {
+                let id = &config.last_region[5..];
+                let live = config_dir.join(format!("sub_{}_live.txt", id));
+                if !live.exists() {
+                    bail!(l10n::t_fmt("proxy.update_before_start", &[id]));
+                }
+                (live, config.last_region.clone())
+            } else {
+                let region =
+                    utils::resolve_region(&config.last_region).unwrap_or_else(|| "eu".into());
+                let file = config_dir.join("lists").join(format!("{}.txt", region));
+                if !file.exists() {
+                    bail!(l10n::t_fmt("proxy.region_file_not_found", &[&region]));
+                }
+                (file, region)
+            }
+        }
+        region if utils::resolve_region(region).is_some() => {
+            let r = utils::resolve_region(region).unwrap();
+            let file = config_dir.join("lists").join(format!("{}.txt", r));
+            if !file.exists() || fs::metadata(&file)?.len() == 0 {
+                bail!(l10n::t_fmt("proxy.region_file_not_found_or_empty", &[&r]));
+            }
+            (file, r)
+        }
+        other => {
+            let parts: Vec<&str> = other.split_whitespace().collect();
+            if parts.len() == 2 && parts[0] == "sub" {
+                let id: usize = parts[1].parse()?;
+                let live = config_dir.join(format!("sub_{}_live.txt", id));
+                if !live.exists() {
+                    bail!(l10n::t_fmt("proxy.update_before_start", &[&id.to_string()]));
+                }
+                (live, format!("_sub_{}", id))
+            } else {
+                bail!(l10n::t_fmt("proxy.unknown_target", &[target]));
+            }
+        }
+    };
+
+    start_xray(&cfg_file, extra_args, config, &config_dir)?;
+    config.last_region = save_region;
+    config.save(config_path)?;
+    Ok(())
+}
+
+pub fn change_profile(
+    action: crate::ChangeCmd,
+    config: &AppConfig,
+    _subs_path: &Path,
+) -> Result<()> {
+    if !is_running(config) {
+        bail!(l10n::t("proxy.not_running"));
+    }
+    let config_dir = dirs::config_dir()
+        .context(l10n::t("proxy.config_dir_missing"))?
+        .join("vpn-manager");
+
+    let current_cfg = if config.last_region.starts_with("_sub_") {
+        let id = &config.last_region[5..];
+        config_dir.join(format!("sub_{}_live.txt", id))
+    } else {
+        let region = utils::resolve_region(&config.last_region).unwrap_or_else(|| "eu".into());
+        config_dir.join("lists").join(format!("{}.txt", region))
+    };
+    if !current_cfg.exists() {
+        bail!(l10n::t_fmt(
+            "proxy.config_not_found",
+            &[&current_cfg.display().to_string()]
+        ));
+    }
+
+    let profiles: Vec<String> = fs::read_to_string(&current_cfg)?
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+
+    if profiles.is_empty() {
+        bail!(l10n::t("proxy.profile_list_empty"));
+    }
+
+    let selected = match action {
+        crate::ChangeCmd::Next => {
+            if profiles.len() > 1 {
+                profiles[1].clone()
+            } else {
+                profiles[0].clone()
+            }
+        }
+        crate::ChangeCmd::Prev => {
+            let n = profiles.len();
+            if n > 1 {
+                profiles[n - 1].clone()
+            } else {
+                profiles[0].clone()
+            }
+        }
+        crate::ChangeCmd::Random => {
+            let n = profiles.len();
+            let idx = rand::random::<usize>() % n;
+            profiles[idx].clone()
+        }
+        crate::ChangeCmd::Fastest => profiles[0].clone(),
+    };
+
+    let tmp_file = tempfile::NamedTempFile::new()?;
+    fs::write(tmp_file.path(), &selected)?;
+    stop_proxy(config)?;
+    start_xray(tmp_file.path(), &[], config, &config_dir)?;
+    println!("{}", l10n::t("proxy.changed"));
+    Ok(())
+}
+
+fn start_xray(
+    cfg_file: &Path,
+    extra_args: &[String],
+    config: &AppConfig,
+    config_dir: &Path,
+) -> Result<()> {
+    let mut args = vec!["-f".to_string(), cfg_file.to_string_lossy().into()];
+    if config.last_mode_type == "system" {
+        args.push("--mode".into());
+        args.push("system".into());
+        args.push("--port".into());
+        args.push(config.default_port.to_string());
+    } else {
+        args.push("--inbound".into());
+        args.push(config.last_inbound_proto.clone());
+        args.push("--port".into());
+        args.push(config.default_port.to_string());
+    }
+    if config.insecure {
+        args.push("-e".into());
+    }
+    args.push("--core".into());
+    args.push(config.core.clone());
+    args.extend_from_slice(extra_args);
+    if !args.contains(&"-r".to_string()) && !args.contains(&"--rotate".to_string()) {
+        args.push("--rotate".into());
+        args.push(config.rotate.to_string());
+    }
+    args.push("--blacklist-duration".into());
+    args.push(config.blacklist_duration.to_string());
+    args.push("--blacklist-strikes".into());
+    args.push(config.blacklist_strikes.to_string());
+
+    let log_file_path = config_dir.join("vpn-manager.log");
+    let mut child = vpn_knife::spawn_proxy(&args, &log_file_path)?;
+
+    let pid = child.id();
+    std::thread::sleep(Duration::from_secs(1));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            bail!(l10n::t_fmt(
+                "proxy.process_died",
+                &[
+                    &status.code().unwrap_or(1).to_string(),
+                    &log_file_path.display().to_string()
+                ]
+            ));
+        }
+        Ok(None) => {
+            fs::write(pid_file_path()?, pid.to_string())?;
+        }
+        Err(e) => {
+            bail!(l10n::t_fmt("proxy.process_check_error", &[&e.to_string()]));
+        }
+    }
+
+    let mode_str = if config.last_mode_type == "system" {
+        "system"
+    } else {
+        &format!("inbound ({})", config.last_inbound_proto)
+    };
+    println!("{}", l10n::t("proxy.started"));
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "proxy.file",
+            &[&cfg_file.display().to_string(), &config.core]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "proxy.address",
+            &[&config.listen_ip, &config.default_port.to_string()]
+        )
+    );
+    println!("{}", l10n::t_fmt("proxy.mode", &[mode_str]));
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "proxy.rotation",
+            &[
+                &config.rotate.to_string(),
+                &config.blacklist_strikes.to_string(),
+                &config.blacklist_duration.to_string()
+            ]
+        )
+    );
+    println!(
+        "{}",
+        l10n::t_fmt("proxy.extra_flags", &[&format!("{:?}", extra_args)])
+    );
+
+    if let Some(info) = get_config_info_from_file(cfg_file, config) {
+        println!(
+            "{}",
+            l10n::t_fmt(
+                "proxy.server",
+                &[
+                    &info.flag,
+                    &info.country,
+                    &info.host,
+                    &info.ip,
+                    &info.protocol
+                ]
+            )
+        );
+    }
+
+    println!("{}", l10n::t_fmt("proxy.pid", &[&pid.to_string()]));
+    println!("══════════════════════════════════════════════════════");
+    Ok(())
+}
+
+pub fn show_start_help(config: &AppConfig, subs_path: &Path) {
+    println!("{}", l10n::t("proxy.show_start_help_title"));
+    println!("{}", l10n::t("proxy.show_start_help_line1"));
+    println!("{}", l10n::t("proxy.show_start_help_line2"));
+    println!("{}", l10n::t("proxy.show_start_help_line3"));
+    println!("{}", l10n::t("proxy.show_start_help_line4"));
+    println!("{}", l10n::t("proxy.show_start_help_line5"));
+    println!("{}", l10n::t("proxy.show_start_help_flags1"));
+    println!("{}", l10n::t("proxy.show_start_help_flags2"));
+    println!("{}", l10n::t("proxy.show_start_help_flags3"));
+    println!("{}", l10n::t("proxy.regions"));
+    if let Some(config_dir) = dirs::config_dir() {
+        let lists_dir = config_dir.join("vpn-manager").join("lists");
+        for region in &["ru", "us", "eu", "de", "pl", "fi", "nl", "other"] {
+            let file = lists_dir.join(format!("{}.txt", region));
+            let count = if file.exists() {
+                fs::read_to_string(&file)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            println!(
+                "{}",
+                l10n::t_fmt("proxy.live_count", &[region, &count.to_string()])
+            );
+        }
+    } else {
+        println!("{}", l10n::t("proxy.config_dir_missing"));
+    }
+    println!("{}", l10n::t("proxy.subs_title"));
+    subs::list_subscriptions(subs_path, config);
+    println!("{}", l10n::t("proxy.show_start_help_footer"));
+}
+
+pub fn get_current_config_info(config: &AppConfig) -> Option<ConfigInfo> {
+    let config_dir = dirs::config_dir()?.join("vpn-manager");
+    let cfg_file = if config.last_region.starts_with("_sub_") {
+        let id = &config.last_region[5..];
+        config_dir.join(format!("sub_{}_live.txt", id))
+    } else {
+        let region = utils::resolve_region(&config.last_region)?;
+        config_dir.join("lists").join(format!("{}.txt", region))
+    };
+    get_config_info_from_file(&cfg_file, config)
+}
+
+fn get_config_info_from_file(cfg_file: &Path, config: &AppConfig) -> Option<ConfigInfo> {
+    if !cfg_file.exists() {
+        return None;
+    }
+    let first_link = fs::read_to_string(cfg_file)
+        .ok()?
+        .lines()
+        .next()?
+        .to_string();
+    let host = utils::extract_host(&first_link);
+    if host == "unknown" {
+        return None;
+    }
+    let ip = utils::resolve_ip(&host)?;
+    let code = crate::geo::country_code(&ip, &config.geoip_db);
+    let country = code.clone().unwrap_or_else(|| "??".into());
+    let flag = match code.as_deref() {
+        Some("RU") => "🇷🇺",
+        Some("US") => "🇺🇸",
+        Some("DE") => "🇩🇪",
+        Some("PL") => "🇵🇱",
+        Some("FI") => "🇫🇮",
+        Some("NL") => "🇳🇱",
+        Some("EU") => "🇪🇺",
+        Some(_) => "🌍",
+        _ => "🌍",
+    };
+    let protocol = if first_link.starts_with("vless://") {
+        "vless"
+    } else if first_link.starts_with("vmess://") {
+        "vmess"
+    } else if first_link.starts_with("trojan://") {
+        "trojan"
+    } else if first_link.starts_with("ss://") {
+        "ss"
+    } else {
+        "?"
+    };
+    Some(ConfigInfo {
+        flag: flag.to_string(),
+        country,
+        host,
+        ip,
+        protocol: protocol.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_pid_file_path_returns_result() {
+        let path = pid_file_path();
+        match path {
+            Ok(p) => assert!(p.ends_with("xray-knife.pid")),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn test_get_config_info_from_file_empty_file() {
+        let file = NamedTempFile::new().unwrap();
+        let config = AppConfig::default();
+        let info = get_config_info_from_file(file.path(), &config);
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_get_config_info_from_file_valid_link() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            "vless://a@1.2.3.4:443?security=reality#MyProxy\n",
+        )
+        .unwrap();
+        let config = AppConfig::default();
+        let info = get_config_info_from_file(file.path(), &config);
+        let _ = info;
+    }
+}
+
+=== ./src/subs.rs ===
+use crate::l10n;
+use crate::SubsCmd;
+use crate::SwitchCmd;
+use anyhow::{bail, Context, Result};
+use std::path::Path;
+use vpn_core::config::AppConfig;
+use vpn_core::http_tester::HttpTester;
+use vpn_subs::crud;
+
+pub use vpn_subs::crud::list_subscriptions;
+
+pub fn handle_subs_ext(
+    action: Option<SubsCmd>,
+    subs_path: &Path,
+    config: &AppConfig,
+    db: Option<&rusqlite::Connection>,
+    tester: &dyn HttpTester,
+) -> Result<()> {
+    match action.unwrap_or(SubsCmd::List) {
+        SubsCmd::List => {
+            crud::list_subscriptions(subs_path, config);
+            println!("{}", l10n::t("subs.help"));
+            Ok(())
+        }
+        SubsCmd::Add => crud::add_subscription(subs_path),
+        SubsCmd::Edit { id } => crud::edit_subscription(subs_path, id),
+        SubsCmd::Remove { ids } => crud::remove_subscriptions(subs_path, &ids),
+        SubsCmd::Update {
+            target,
+            info,
+            protocol,
+            limit,
+            keep_raw,
+            ..
+        } => {
+            let t = target.unwrap_or_else(|| "all".to_string());
+            crate::update::handle_update(
+                &t, &protocol, limit, keep_raw, info, config, subs_path, db, tester,
+            )?;
+            Ok(())
+        }
+        SubsCmd::Switch { action } => match action {
+            SwitchCmd::On { ids } => crud::switch_subscriptions(subs_path, &ids, true),
+            SwitchCmd::Off { ids } => crud::switch_subscriptions(subs_path, &ids, false),
+        },
+        SubsCmd::Cfscanner { sub_id, args } => {
+            let config_dir = dirs::config_dir()
+                .context(l10n::t("subs.config_dir_missing"))?
+                .join("vpn-manager");
+            let mut full_args = vec![];
+            if let Some(sid) = sub_id {
+                let proxy_config = config_dir.join(format!("sub_{}_live.txt", sid));
+                if proxy_config.exists() {
+                    full_args.push("-C".to_string());
+                    full_args.push(proxy_config.to_string_lossy().into());
+                } else {
+                    bail!(l10n::t_fmt("subs.subs_not_found", &[&sid.to_string()]));
+                }
+            }
+            full_args.extend(args);
+            vpn_knife::run_knife("cfscanner", &full_args)
+        }
+    }
+}
+
+=== ./src/update.rs ===
+use crate::geo;
+use crate::l10n;
+use anyhow::{Context, Result};
+use chrono::Local;
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use vpn_core::config::AppConfig;
+use vpn_core::http_tester::HttpTester;
+use vpn_core::utils;
+use vpn_subs::crud;
+use vpn_subs::update as subs_update;
+
+/// Координирует обновление одной или нескольких подписок, вызывает vpn-subs
+#[allow(clippy::too_many_arguments)]
+pub fn handle_update(
+    target: &str,
+    protocol: &str,
+    limit: usize,
+    keep_raw: bool,
+    show_info: bool,
+    config: &AppConfig,
+    subs_path: &Path,
+    db: Option<&Connection>,
+    tester: &dyn HttpTester,
+) -> Result<()> {
+    let subs = crud::load_subs(subs_path)?;
+    let ids = if target == "all" {
+        subs.iter().map(|s| s.id).collect()
+    } else {
+        utils::expand_ids(target)?
+    };
+    for id in ids {
+        if let Some(sub) = subs.iter().find(|s| s.id == id) {
+            update_single(
+                sub, protocol, limit, keep_raw, show_info, config, db, tester,
+            )?;
+        } else {
+            eprintln!("{}", l10n::t_fmt("subs.subs_not_found", &[&id.to_string()]));
+        }
+    }
+    Ok(())
+}
+
+/// Обновляет одну подписку: загрузка, фильтрация, тесты, сохранение, классификация
+#[allow(clippy::too_many_arguments)]
+fn update_single(
+    sub: &vpn_core::types::Subscription,
+    proto: &str,
+    limit: usize,
+    keep_raw: bool,
+    show_info: bool,
+    config: &AppConfig,
+    db: Option<&Connection>,
+    tester: &dyn HttpTester,
+) -> Result<()> {
+    println!(
+        "{}",
+        l10n::t_fmt("subs.update_started", &[&sub.id.to_string(), &sub.name])
+    );
+    let config_dir = dirs::config_dir()
+        .context(l10n::t("proxy.config_dir_missing"))?
+        .join("vpn-manager");
+
+    // 1. Загрузка и тестирование через vpn-subs
+    let live_files =
+        subs_update::update_single_sub(sub, proto, limit, keep_raw, show_info, config, tester)?;
+
+    // 2. Сохранение результатов
+    let merged = format!("/tmp/vpn-sub-{}-live-merged.txt", sub.id);
+    utils::merge_files(&live_files, &merged)?;
+    let dest = config_dir.join(format!("sub_{}_live.txt", sub.id));
+    fs::copy(&merged, &dest)?;
+    let ts = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    fs::write(config_dir.join(format!("sub_{}_timestamp.txt", sub.id)), ts)?;
+
+    // 3. Статистика (если есть БД)
+    if let Some(conn) = db {
+        let active_urls = utils::get_active_urls(config);
+        record_stats(sub.id, &active_urls, config, conn)?;
+    }
+
+    // 4. Обновление all_live и классификация
+    let mut all_live_content = String::new();
+    for entry in fs::read_dir(&config_dir)? {
+        let entry = entry?;
+        let fname = entry.file_name();
+        if let Some(name) = fname.to_str() {
+            if name.starts_with("sub_") && name.ends_with("_live.txt") {
+                if let Ok(data) = fs::read_to_string(entry.path()) {
+                    all_live_content.push_str(&data);
+                }
+            }
+        }
+    }
+    let all_live = config_dir.join("all_live_merged.txt");
+    fs::write(&all_live, utils::unique_lines(&all_live_content))?;
+    classify_configs(&all_live, config)?;
+
+    if !keep_raw {
+        let _ = fs::remove_file(format!("/tmp/vpn-sub-{}-raw.txt", sub.id));
+        let _ = fs::remove_file(format!("/tmp/vpn-sub-{}-filtered.txt", sub.id));
+        let _ = fs::remove_file(&merged);
+        for f in &live_files {
+            let _ = fs::remove_file(f);
+        }
+    }
+    println!(
+        "{}",
+        l10n::t_fmt("subs.update_finished", &[&sub.id.to_string()])
+    );
+    Ok(())
+}
+
+/// Запись статистики в БД
+fn record_stats(
+    sub_id: usize,
+    urls: &[String],
+    config: &AppConfig,
+    conn: &Connection,
+) -> Result<()> {
+    let log_dir = PathBuf::from(&config.http_log_dir);
+    let tx = conn.unchecked_transaction()?;
+    for url in urls {
+        let log_path = log_dir.join(format!(
+            "vpn-http-{}-{}.log",
+            sub_id,
+            sanitize_filename(url)
+        ));
+        if !log_path.exists() {
+            continue;
+        }
+        let file = fs::File::open(&log_path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.find("://").is_some() {
+                let link = line[..line.find(' ').unwrap_or(line.len())].to_string();
+                let hash = format!("{:x}", Sha256::digest(link.as_bytes()));
+                let host = url::Url::parse(url)
+                    .map(|u| u.host_str().unwrap_or("unknown").to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let latency = extract_latency(&line);
+                let bandwidth = extract_bandwidth(&line);
+                let score = calculate_score(latency, bandwidth, &config.parallel_strategy);
+                tx.execute(
+                    "INSERT INTO profile_host_stats (host, profile_link_hash, success_count, avg_latency_ms, avg_bandwidth_mbps, score, last_used)
+                     VALUES (?1, ?2, 1, ?3, ?4, ?5, strftime('%s','now'))
+                     ON CONFLICT(host, profile_link_hash) DO UPDATE SET
+                     success_count = success_count + 1,
+                     avg_latency_ms = (avg_latency_ms * success_count + ?3) / (success_count + 1),
+                     avg_bandwidth_mbps = (avg_bandwidth_mbps * success_count + ?4) / (success_count + 1),
+                     score = ?5,
+                     last_used = strftime('%s','now')",
+                    rusqlite::params![host, hash, latency.unwrap_or(999.0), bandwidth.unwrap_or(0.0), score],
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn extract_latency(line: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"Delay: (\d+)ms").ok()?;
+    re.captures(line)?.get(1)?.as_str().parse::<f64>().ok()
+}
+
+fn extract_bandwidth(line: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"Speed: ([\d.]+) Mbps").ok()?;
+    re.captures(line)?.get(1)?.as_str().parse::<f64>().ok()
+}
+
+fn calculate_score(latency: Option<f64>, bandwidth: Option<f64>, strategy: &str) -> f64 {
+    match strategy {
+        "latency" => {
+            if let Some(lat) = latency {
+                1000.0 / lat
+            } else {
+                0.0
+            }
+        }
+        "bandwidth" => bandwidth.unwrap_or(0.0),
+        _ => 1.0,
+    }
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.replace(['/', ':', '?', '&'], "_")
+}
+
+fn classify_configs(input_path: &Path, config: &AppConfig) -> Result<()> {
+    let config_dir = dirs::config_dir()
+        .context(l10n::t("proxy.config_dir_missing"))?
+        .join("vpn-manager");
+    let lists_dir = config_dir.join("lists");
+    fs::create_dir_all(&lists_dir)?;
+    let eu_countries = "AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE CH GB IS NO";
+    let eu_list: Vec<&str> = eu_countries.split_whitespace().collect();
+
+    let content = fs::read_to_string(input_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let mut regions: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    regions.insert("all".into(), vec![]);
+    for region in &["ru", "us", "eu", "de", "pl", "fi", "nl", "other"] {
+        regions.insert(region.to_string(), vec![]);
+    }
+
+    let mut skipped = 0;
+    for line in &lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let host = utils::extract_host(line);
+        if host == "unknown" {
+            skipped += 1;
+            continue;
+        }
+        let ip = utils::resolve_ip(&host);
+        if ip.is_none() {
+            skipped += 1;
+            continue;
+        }
+        let ip = ip.unwrap();
+        let code = geo::country_code(&ip, &config.geoip_db);
+        let region = match code.as_deref() {
+            Some("RU") => "ru",
+            Some("US") => "us",
+            Some("DE") => "de",
+            Some("PL") => "pl",
+            Some("FI") => "fi",
+            Some("NL") => "nl",
+            Some(c) if eu_list.contains(&c) => "eu",
+            _ => "other",
+        };
+        if let Some(v) = regions.get_mut(region) {
+            v.push(line.to_string());
+        }
+        regions.get_mut("all").unwrap().push(line.to_string());
+    }
+
+    for (region, lines) in regions.iter_mut() {
+        lines.sort();
+        lines.dedup();
+        let file_path = lists_dir.join(format!("{}.txt", region));
+        fs::write(file_path, lines.join("\n") + "\n")?;
+    }
+    println!(
+        "{}",
+        l10n::t_fmt(
+            "subs.classify_finished",
+            &[&(total - skipped).to_string(), &skipped.to_string()]
+        )
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use rusqlite::Connection;
+    use vpn_core::config::AppConfig;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS profile_host_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT NOT NULL,
+                profile_link_hash TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                avg_latency_ms REAL,
+                avg_bandwidth_mbps REAL,
+                last_used INTEGER,
+                score REAL,
+                UNIQUE(host, profile_link_hash)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_record_stats() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log_dir = dir.path();
+        let log_file = log_dir.join("vpn-http-1-https_test_com.log");
+        std::fs::write(&log_file, "https://test.com 200 Delay: 150ms Speed: 50.0 Mbps\n")?;
+
+        let mut config = AppConfig::default();
+        config.http_log_dir = log_dir.to_string_lossy().into();
+
+        let conn = setup_db();
+
+        // Проверяем, что БД работает и вставка вручную возможна
+        conn.execute(
+            "INSERT INTO profile_host_stats (host, profile_link_hash, success_count) VALUES (?1, ?2, 1)",
+            rusqlite::params!["test.com", "hash"],
+        )?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM profile_host_stats", [], |row| row.get(0))?;
+        assert_eq!(count, 1, "Ручная вставка не сработала");
+
+        // Очищаем таблицу перед вызовом record_stats
+        conn.execute("DELETE FROM profile_host_stats", [])?;
+
+        let urls = vec!["https://test.com".to_string()];
+        record_stats(1, &urls, &config, &conn)?;
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM profile_host_stats", [], |row| row.get(0))?;
+        assert_eq!(count, 1, "record_stats не добавила запись");
+
+        Ok(())
+    }
+}
+
+=== ./locales/ru.json ===
+{
+  "proxy": {
+    "stopped": "✅ Прокси остановлен (PID {0})",
+    "started": "═══════════════════ Прокси запущен ═══════════════════",
+    "file": " Файл: {0} (ядро: {1})",
+    "address": " Адрес: {0}:{1}",
+    "mode": " Режим: {0}",
+    "rotation": " Ротация: каждые {0}с, блэклист: {1}/{2}с",
+    "extra_flags": " Доп. флаги: {0:?}",
+    "server": " Сервер: {0} {1} ({2} / {3}) протокол: {4}",
+    "pid": " PID: {0}",
+    "not_running": "Прокси не запущен. Сначала выполните start.",
+    "config_not_found": "Файл конфигов не найден: {0}",
+    "profile_list_empty": "Список профилей пуст",
+    "changed": "✅ Профиль изменён",
+    "update_before_start": "Сначала обновите подписку {0}",
+    "region_file_not_found": "Файл региона {0} не найден",
+    "region_file_not_found_or_empty": "Файл региона {0} не найден или пуст",
+    "unknown_target": "Неизвестная цель: {0}",
+    "process_died": "Процесс xray-knife proxy неожиданно завершился (код {0:?}). Проверьте лог: {1}",
+    "process_check_error": "Ошибка при проверке процесса: {0}",
+    "proxy_start_fail": "Не удалось запустить xray-knife proxy",
+    "stop_pkill_fail": "Не удалось остановить прокси через pkill",
+    "show_start_help_title": "═════════════════ start – запуск прокси ═════════════════",
+    "show_start_help_line1": " vpn-manager start [menu] это меню",
+    "show_start_help_line2": " vpn-manager start now последний профиль",
+    "show_start_help_line3": " vpn-manager start region <REGION> регион (ru, eu, de…)",
+    "show_start_help_line4": " vpn-manager start sub <ID> подписка по ID",
+    "show_start_help_line5": " vpn-manager start exec <cmd...> выполнить в неймспейсе",
+    "show_start_help_flags1": " -m, --method <random|fastest> метод выбора",
+    "show_start_help_flags2": " -r, --rotate <S> интервал ротации",
+    "show_start_help_flags3": " все флаги xray-knife proxy также принимаются",
+    "regions": "Регионы:",
+    "subs_title": "Подписки:",
+    "show_start_help_footer": "════════════════════════════════════════════════════════",
+    "live_count": " {0:6} – {1:>6} живых",
+    "config_dir_missing": "Не удалось определить конфигурационную директорию"
+  },
+  "subs": {
+    "list_header": "═══════════════════════ Подписки ═══════════════════════",
+    "list_header2": " {0:<4} {1:<20} {2:>2} {3:>6} {4:>12} {5:<30} {6:>12}",
+    "no_subs": "Нет подписок",
+    "config_dir_missing": "Не удалось определить конфигурационную директорию",
+    "added": "✅ Подписка добавлена",
+    "changed": "✅ Подписка изменена",
+    "removed": "✅ Удалено подписок: {0}",
+    "enabled": "✅ Подписки включены: {0}",
+    "disabled": "✅ Подписки выключены: {0}",
+    "not_found": "Подписка не найдена",
+    "subs_not_found": "⚠️ Подписка {0} не найдена",
+    "update_started": "ℹ️ Обновление [{0}] {1}",
+    "update_finished": "✅ Подписка [{0}] обновлена",
+    "no_active_urls": "Нет активных тестовых URL",
+    "no_live_configs": "Нет живых конфигов",
+    "http_test_error": "⚠️ Ошибка HTTP теста для {0}: {1}",
+    "classify_finished": "🌍 Классификация завершена: {0} обработано, {1} пропущено",
+    "unknown_source": "Неизвестный источник: {0}",
+    "auto_id": "Автоматический ID: {0}",
+    "enter_url": "URL подписки: ",
+    "enter_name": "Имя подписки: ",
+    "edit_current": "Текущие данные: ID={0}, Имя={1}, URL={2}",
+    "edit_new_name": "Новое имя (Enter = оставить): ",
+    "edit_new_url": "Новый URL (Enter = оставить): ",
+    "fetch_error": "Не удалось запустить xray-knife subs fetch",
+    "fetch_failed": "xray-knife subs fetch завершился с ошибкой (код {0:?})",
+    "help": "Команды subs:\n list показать список (по умолчанию)\n add добавить подписку\n edit <ID> изменить подписку\n remove <IDs> удалить (all, 1,2-4, 1,3,5)\n update <IDs> [-i] [-p proto] [-l N] [-k on|off] [-x]\n switch on/off <IDs> включить/выключить\n cfscanner [--sub-id ID] [флаги]"
+  },
+  "settings": {
+    "saved": "✅ {0}",
+    "reset": "✅ Сброшено на умолчания",
+    "invalid_method": "Метод должен быть random или fastest",
+    "current_title": "Текущие настройки:",
+    "port": "  Порт:            {0}",
+    "ip": "  IP:              {0}",
+    "proto": "  Протокол:        {0}",
+    "method": "  Метод:           {0}",
+    "mode": "  Режим:           {0}",
+    "core": "  Ядро:            {0}",
+    "rotate": "  Ротация:         {0} с",
+    "insecure": "  Insecure:        {0}",
+    "speedtest": "  Speedtest:       {0}",
+    "http_verbose": "  HTTP verbose:    {0}",
+    "show_info": "  Показ инфо при обн.: {0}",
+    "parallel_tests": "  Параллельные тесты: {0}",
+    "blacklist": "  Блэклист:        ошибок {0}, длит. {1} с",
+    "auto_update": "  Автообновление:  {0} мин, IDs: {1}",
+    "auto_menu_update": "  Автообновление меню: {0}",
+    "active_urls": "  Активные URL:    {0}",
+    "on": "вкл",
+    "off": "выкл",
+    "port_saved": "Порт: {0}",
+    "ip_saved": "IP прослушивания: {0}",
+    "proto_saved": "Протокол: {0}",
+    "method_saved": "Метод выбора: {0}",
+    "mode_saved": "Режим: {0}",
+    "core_saved": "Ядро: {0}",
+    "rotate_saved": "Ротация: {0}с",
+    "insecure_saved": "Insecure: {0}",
+    "speedtest_saved": "Speedtest: {0}",
+    "http_verbose_saved": "HTTP verbose: {0}",
+    "show_info_saved": "Показывать инфо при обновлении: {0}",
+    "parallel_saved": "Параллельных тестов: {0}",
+    "blacklist_duration_saved": "Блэклист: {0} с",
+    "blacklist_strikes_saved": "Ошибок до блэклиста: {0}",
+    "auto_update_saved": "Автообновление: {0} мин для {1}",
+    "auto_menu_update_saved": "Автообновление меню: {0}"
+  },
+  "status": {
+    "title": "═══════════════════ Состояние ═══════════════════",
+    "port": "  Порт:            {0}",
+    "region": "  Регион:          {0}",
+    "mode": "  Режим:           {0}",
+    "core": "  Ядро:            {0}",
+    "rotate": "  Ротация:         {0} с",
+    "insecure": "  Insecure:        {0}",
+    "speedtest": "  Speedtest:       {0}",
+    "http_verbose": "  HTTP verbose:    {0}",
+    "proxy_running": "  Прокси:          {0}{1}\u001b[0m",
+    "server": "  Текущий сервер:  {0} {1} ({2})",
+    "ip_proto": "  IP:              {0} (протокол: {1})",
+    "running": "запущен",
+    "not_running": "не запущен"
+  },
+  "common": {
+    "yes": "вкл",
+    "no": "выкл",
+    "unknown": "неизвестно"
+  },
+  "config": {
+    "load_error": "Ошибка парсинга config.json",
+    "dir_missing": "Не удалось определить конфигурационную директорию"
+  },
+  "db": {
+    "open_error": "Не удалось открыть БД SQLite"
+  },
+  "commands": {
+    "parse_error": "Ошибка парсинга commands.json"
+  },
+  "knife": {
+    "fetch_error": "Не удалось запустить xray-knife subs fetch",
+    "fetch_failed": "xray-knife subs fetch завершился с ошибкой (код {0:?})",
+    "http_error": "xray-knife http завершился с ошибкой",
+    "proxy_start_fail": "Не удалось запустить xray-knife proxy",
+    "knife_start_fail": "Не удалось запустить xray-knife"
+  },
+  "http_tester": {
+    "file_move_error": "Ошибка перемещения файла: {0}",
+    "empty_result": "Пустой результат теста",
+    "thread_panic": "Поток HTTP-теста упал: {0:?}"
+  },
+  "utils": {
+    "invalid_range": "неверный диапазон: {0}",
+    "range_start_gt_end": "начало диапазона больше конца: {0}-{1}"
+  },
+  "main": {
+    "no_help": "Не загружены описания команд. Используйте --help",
+    "dir_missing": "Не удалось определить config директорию",
+    "create_dir_fail": "Не удалось создать директорию конфига"
+  }
+}
+=== ./crates/vpn-core/src/lib.rs ===
+pub mod config;
+pub mod http_tester;
+pub mod types;
+pub mod utils;
+
+=== ./crates/vpn-core/src/types.rs ===
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Subscription {
+    pub id: usize,
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+pub type Subscriptions = Vec<Subscription>;
+
+#[derive(Debug, Clone)]
+pub struct ConfigInfo {
+    pub flag: String,
+    pub country: String,
+    pub host: String,
+    pub ip: String,
+    pub protocol: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ParallelRule {
+    pub domain: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub max_profiles: Option<usize>,
+    pub strategy: Option<String>,
+    pub exit_countries: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_fallback: bool,
+}
+
+=== ./crates/vpn-core/src/http_tester.rs ===
+use crate::config::AppConfig;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct LiveResult {
+    pub url: String,
+    pub success: bool,
+    pub live_file_path: Option<PathBuf>,
+    pub error: Option<String>,
+}
+
+pub struct TestConfig<'a> {
+    pub sub_id: usize,
+    pub timeout: u64,
+    pub threads: usize,
+    pub insecure: bool,
+    pub speedtest: bool,
+    pub show_info: bool,
+    pub log_dir: PathBuf,
+    #[allow(dead_code)]
+    pub config: &'a AppConfig,
+}
+
+pub trait HttpTester {
+    fn run_tests(
+        &self,
+        config_file: &Path,
+        urls: &[String],
+        cfg: &TestConfig,
+    ) -> anyhow::Result<Vec<LiveResult>>;
+}
+
+=== ./crates/vpn-core/src/config.rs ===
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct AppConfig {
+    pub default_port: u16,
+    pub listen_ip: String,
+    pub http_test_timeout: u64,
+    pub http_test_threads: usize,
+    pub parallel_tests: usize,
+    pub http_url_pool_data: String,
+    pub http_url_active_ids: String,
+    pub update_protocol_filter: String,
+    pub update_limit_per_sub: usize,
+    pub keep_raw: bool,
+    pub auto_update_interval: u64,
+    pub auto_update_ids: String,
+    pub menu_update_interval: u64,
+    pub select_mode: String,
+    pub menu_position: usize,
+    pub geoip_db: String,
+    pub log_file: String,
+    pub http_log_dir: String,
+    pub last_region: String,
+    pub last_mode_type: String,
+    pub last_inbound_proto: String,
+    pub core: String,
+    pub insecure: bool,
+    pub rotate: u64,
+    pub blacklist_duration: u64,
+    pub blacklist_strikes: u32,
+    pub speedtest: bool,
+    pub http_verbose: bool,
+    pub show_update_info: bool,
+    pub auto_menu_update_enabled: bool,
+    pub auto_menu_update_interval: u64,
+
+    pub parallel_enabled: bool,
+    pub parallel_geo_balancing: bool,
+    pub parallel_geo_cache_ttl: u64,
+    pub parallel_max_profiles: usize,
+    pub parallel_timeout_ms: u64,
+    pub parallel_strategy: String,
+    pub parallel_db_path: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("vpn-manager");
+        Self {
+            default_port: 8880,
+            listen_ip: "127.0.0.1".into(),
+            http_test_timeout: 5000,
+            http_test_threads: 50,
+            parallel_tests: 10,
+            http_url_pool_data: "1|https://cloudflare.com/cdn-cgi/trace;2|https://www.google.com/generate_204;3|https://httpbin.org/ip".into(),
+            http_url_active_ids: "1,2,3".into(),
+            update_protocol_filter: "all".into(),
+            update_limit_per_sub: 0,
+            keep_raw: true,
+            auto_update_interval: 0,
+            auto_update_ids: "all".into(),
+            menu_update_interval: 0,
+            select_mode: "fastest".into(),
+            menu_position: 1,
+            geoip_db: "/usr/share/GeoIP/GeoLite2-Country.mmdb".into(),
+            log_file: config_dir.join("vpn-manager.log").to_string_lossy().into(),
+            http_log_dir: config_dir.join("http-logs").to_string_lossy().into(),
+            last_region: "eu".into(),
+            last_mode_type: "inbound".into(),
+            last_inbound_proto: "socks".into(),
+            core: "xray".into(),
+            insecure: false,
+            rotate: 300,
+            blacklist_duration: 600,
+            blacklist_strikes: 3,
+            speedtest: false,
+            http_verbose: true,
+            show_update_info: false,
+            auto_menu_update_enabled: false,
+            auto_menu_update_interval: 0,
+            parallel_enabled: false,
+            parallel_geo_balancing: false,
+            parallel_geo_cache_ttl: 3600,
+            parallel_max_profiles: 3,
+            parallel_timeout_ms: 5000,
+            parallel_strategy: "latency".into(),
+            parallel_db_path: config_dir.join("parallel_stats.db").to_string_lossy().into(),
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
+        if path.exists() {
+            let content = fs::read_to_string(path)?;
+            serde_json::from_str(&content).context("Ошибка парсинга config.json")
+        } else {
+            let cfg = Self::default();
+            let json = serde_json::to_string_pretty(&cfg)?;
+            fs::write(path, json)?;
+            Ok(cfg)
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+}
+
+=== ./crates/vpn-core/src/utils.rs ===
+use anyhow::Result;
+use std::fs;
+use std::net::ToSocketAddrs;
+
+pub fn extract_host(link: &str) -> String {
+    if link.starts_with("vless://") || link.starts_with("trojan://") || link.starts_with("ss://") {
+        if let Some(at) = link.find('@') {
+            let rest = &link[at + 1..];
+            let host = rest
+                .split([':', '/', '?', '#', ' '])
+                .next()
+                .unwrap_or("unknown");
+            return host.to_string();
+        }
+    } else if link.starts_with("vmess://") {
+        let encoded = link.trim_start_matches("vmess://");
+        if let Ok(decoded) = base64_decode(encoded) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&decoded) {
+                if let Some(add) = json.get("add").and_then(|v| v.as_str()) {
+                    return add.to_string();
+                }
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn base64_decode(s: &str) -> Result<String, base64::DecodeError> {
+    use base64::{engine::general_purpose, Engine as _};
+    let bytes = general_purpose::STANDARD.decode(s)?;
+    Ok(String::from_utf8_lossy(&bytes).into())
+}
+
+pub fn resolve_ip(host: &str) -> Option<String> {
+    (host, 0)
+        .to_socket_addrs()
+        .ok()?
+        .next()
+        .map(|addr| addr.ip().to_string())
+}
+
+pub fn expand_ids(spec: &str) -> Result<Vec<usize>> {
+    let mut ids = vec![];
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.contains('-') {
+            let bounds: Vec<&str> = part.split('-').collect();
+            if bounds.len() != 2 {
+                anyhow::bail!("неверный диапазон: {}", part);
+            }
+            let start: usize = bounds[0].parse()?;
+            let end: usize = bounds[1].parse()?;
+            if start > end {
+                anyhow::bail!("начало диапазона больше конца: {}-{}", start, end);
+            }
+            ids.extend(start..=end);
+        } else {
+            ids.push(part.parse()?);
+        }
+    }
+    Ok(ids)
+}
+
+pub fn filter_subscription_file(
+    input: &str,
+    output: &str,
+    proto: &str,
+    limit: usize,
+) -> Result<()> {
+    let content = fs::read_to_string(input)?;
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+        .collect();
+    let filtered: Vec<&str> = if proto == "all" {
+        lines
+    } else {
+        let prefix = format!("{}://", proto);
+        lines
+            .into_iter()
+            .filter(|l| l.starts_with(&prefix))
+            .collect()
+    };
+    let limited = if limit > 0 && limit < filtered.len() {
+        filtered[..limit].to_vec()
+    } else {
+        filtered
+    };
+    fs::write(output, limited.join("\n") + "\n")?;
+    Ok(())
+}
+
+pub fn get_active_urls(config: &crate::config::AppConfig) -> Vec<String> {
+    let active_ids: Vec<&str> = config
+        .http_url_active_ids
+        .split(',')
+        .map(|s| s.trim())
+        .collect();
+    let mut urls = vec![];
+    for entry in config.http_url_pool_data.split(';') {
+        let parts: Vec<&str> = entry.splitn(2, '|').collect();
+        if parts.len() == 2 && active_ids.contains(&parts[0]) {
+            urls.push(parts[1].to_string());
+        }
+    }
+    urls
+}
+
+pub fn merge_files(files: &[std::path::PathBuf], output: &str) -> Result<()> {
+    let mut all = String::new();
+    for f in files {
+        all.push_str(&fs::read_to_string(f)?);
+    }
+    fs::write(output, unique_lines(&all))?;
+    Ok(())
+}
+
+pub fn unique_lines(s: &str) -> String {
+    let mut lines: Vec<&str> = s.lines().collect();
+    lines.sort();
+    lines.dedup();
+    lines.join("\n") + "\n"
+}
+
+pub fn resolve_region(input: &str) -> Option<String> {
+    match input {
+        "ru" | "us" | "eu" | "de" | "pl" | "fi" | "nl" | "other" | "all" => Some(input.to_string()),
+        "russia" => Some("ru".into()),
+        "usa" => Some("us".into()),
+        "europe" => Some("eu".into()),
+        "germany" => Some("de".into()),
+        "poland" => Some("pl".into()),
+        "finland" => Some("fi".into()),
+        "netherlands" => Some("nl".into()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_expand_ids_single() {
+        assert_eq!(expand_ids("5").unwrap(), vec![5]);
+    }
+
+    #[test]
+    fn test_expand_ids_range() {
+        assert_eq!(expand_ids("1-3").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_ids_mixed() {
+        assert_eq!(expand_ids("1,3-5,7").unwrap(), vec![1, 3, 4, 5, 7]);
+    }
+
+    #[test]
+    fn test_expand_ids_invalid_range_reversed() {
+        assert!(expand_ids("3-1").is_err());
+    }
+
+    #[test]
+    fn test_expand_ids_invalid_format() {
+        assert!(expand_ids("1-3-5").is_err());
+    }
+
+    #[test]
+    fn test_filter_subscription_file_all_proto() -> anyhow::Result<()> {
+        let input = "vless://example.com\nvmess://example.com\ntrojan://example.com\n# comment\n\nss://example.com";
+        let input_file = NamedTempFile::new()?;
+        let output_file = NamedTempFile::new()?;
+        fs::write(input_file.path(), input)?;
+
+        filter_subscription_file(
+            input_file.path().to_str().unwrap(),
+            output_file.path().to_str().unwrap(),
+            "all",
+            0,
+        )?;
+
+        let result = fs::read_to_string(output_file.path())?;
+        let expected =
+            "vless://example.com\nvmess://example.com\ntrojan://example.com\nss://example.com\n";
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_subscription_file_specific_proto() -> anyhow::Result<()> {
+        let input = "vless://a.com\nvmess://b.com\nvless://c.com";
+        let input_file = NamedTempFile::new()?;
+        let output_file = NamedTempFile::new()?;
+        fs::write(input_file.path(), input)?;
+
+        filter_subscription_file(
+            input_file.path().to_str().unwrap(),
+            output_file.path().to_str().unwrap(),
+            "vless",
+            0,
+        )?;
+
+        let result = fs::read_to_string(output_file.path())?;
+        assert_eq!(result, "vless://a.com\nvless://c.com\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_subscription_file_with_limit() -> anyhow::Result<()> {
+        let input = "vless://a\nvless://b\nvless://c";
+        let input_file = NamedTempFile::new()?;
+        let output_file = NamedTempFile::new()?;
+        fs::write(input_file.path(), input)?;
+
+        filter_subscription_file(
+            input_file.path().to_str().unwrap(),
+            output_file.path().to_str().unwrap(),
+            "vless",
+            2,
+        )?;
+
+        let result = fs::read_to_string(output_file.path())?;
+        assert_eq!(result, "vless://a\nvless://b\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_region_short() {
+        assert_eq!(resolve_region("ru"), Some("ru".into()));
+        assert_eq!(resolve_region("eu"), Some("eu".into()));
+    }
+
+    #[test]
+    fn test_resolve_region_full_name() {
+        assert_eq!(resolve_region("russia"), Some("ru".into()));
+        assert_eq!(resolve_region("germany"), Some("de".into()));
+    }
+
+    #[test]
+    fn test_resolve_region_unknown() {
+        assert_eq!(resolve_region("unknown"), None);
+    }
+
+    #[test]
+    fn test_get_active_urls() {
+        let mut config = crate::config::AppConfig::default();
+        config.http_url_active_ids = "1,3".into();
+        config.http_url_pool_data =
+            "1|https://test1.com;2|https://test2.com;3|https://test3.com".into();
+        let urls = get_active_urls(&config);
+        assert_eq!(urls, vec!["https://test1.com", "https://test3.com"]);
+    }
+
+    #[test]
+    fn test_merge_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let f1 = dir.path().join("f1.txt");
+        let f2 = dir.path().join("f2.txt");
+        std::fs::write(&f1, "line1\nline2\n")?;
+        std::fs::write(&f2, "line2\nline3\n")?;
+        let output = dir.path().join("merged.txt");
+        let out_str = output.to_str().unwrap();
+        merge_files(&[f1, f2], out_str)?;
+        let result = std::fs::read_to_string(&output)?;
+        assert_eq!(result, "line1\nline2\nline3\n"); // unique_lines сортирует и убирает дубли
+        Ok(())
+    }
+}
+
+=== ./crates/vpn-core/Cargo.toml ===
+[package]
+name = "vpn-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+url = "2"
+base64 = "0.21"
+anyhow = "1.0"
+dirs = "4.0"
+
+[dev-dependencies]
+tempfile = "3.3"
+=== ./crates/vpn-subs/src/lib.rs ===
+pub mod crud;
+pub mod update;
+
+=== ./crates/vpn-subs/src/crud.rs ===
+use anyhow::{Context, Result};
+use serde_json;
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
+use url::Url;
+use vpn_core::config::AppConfig;
+use vpn_core::types::{Subscription, Subscriptions};
+use vpn_core::utils;
+
+pub fn load_subs(path: &Path) -> Result<Subscriptions> {
+    if path.exists() {
+        let content = fs::read_to_string(path)?;
+        let v: serde_json::Value = serde_json::from_str(&content)?;
+        if let Some(subs) = v.get("subscriptions").and_then(|s| s.as_array()) {
+            Ok(serde_json::from_value(serde_json::Value::Array(
+                subs.clone(),
+            ))?)
+        } else if v.is_array() {
+            Ok(serde_json::from_value(v)?)
+        } else {
+            anyhow::bail!("Неверный формат subscriptions.json")
+        }
+    } else {
+        Ok(vec![])
+    }
+}
+
+pub fn save_subs(path: &Path, subs: &Subscriptions) -> Result<()> {
+    let obj = serde_json::json!({ "subscriptions": subs });
+    let json = serde_json::to_string_pretty(&obj)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn shorten_url(url: &str) -> String {
+    let parsed = Url::parse(url).ok();
+    if let Some(parsed) = parsed {
+        let domain = parsed.host_str().unwrap_or("");
+        let path = parsed.path();
+        let trimmed = if path.len() > 30 { &path[..30] } else { path };
+        format!("{}/{}", domain, trimmed.trim_start_matches('/'))
+    } else {
+        if url.len() <= 55 {
+            url.to_string()
+        } else {
+            format!("{}...{}", &url[..30], &url[url.len() - 20..])
+        }
+    }
+}
+
+fn is_https(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
+pub fn list_subscriptions(path: &Path, config: &AppConfig) {
+    let subs = match load_subs(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Ошибка загрузки подписок: {e}");
+            return;
+        }
+    };
+    if subs.is_empty() {
+        println!("Нет подписок"); // оставим без локализации пока, позже интегрируем
+        return;
+    }
+    let config_dir = match dirs::config_dir() {
+        Some(d) => d.join("vpn-manager"),
+        None => {
+            eprintln!("Не удалось определить конфигурационную директорию");
+            return;
+        }
+    };
+    println!("═══════════════════════ Подписки ═══════════════════════");
+    println!(
+        " {:<4} {:<20} {:>2} {:>6} {:>12} {:<30} {:>12}",
+        "ID", "Имя", "TS", "Живых", "Обновлено", "Ссылка", "Автообн."
+    );
+    for sub in subs {
+        let live_path = config_dir.join(format!("sub_{}_live.txt", sub.id));
+        let count = if live_path.exists() {
+            fs::read_to_string(&live_path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let ts_path = config_dir.join(format!("sub_{}_timestamp.txt", sub.id));
+        let updated = fs::read_to_string(&ts_path).unwrap_or_else(|_| "—".into());
+        let short_url = shorten_url(&sub.url);
+        let insecure_mark = if is_https(&sub.url) { "🔒" } else { "🔓" };
+        let auto_update = if config.auto_update_interval > 0
+            && (config.auto_update_ids == "all"
+                || utils::expand_ids(&config.auto_update_ids)
+                    .unwrap_or_default()
+                    .contains(&sub.id))
+        {
+            format!("{}м", config.auto_update_interval)
+        } else {
+            "—".to_string()
+        };
+
+        let color = if !sub.enabled || count == 0 {
+            "\x1b[31m"
+        } else {
+            ""
+        };
+        println!(
+            " {}{:<4} {:<20.20} {:<2} {:>6} {:>12} {:<30.30} {:>12}\x1b[0m",
+            color,
+            sub.id,
+            sub.name,
+            insecure_mark,
+            count,
+            updated.trim(),
+            short_url,
+            auto_update
+        );
+    }
+}
+
+pub fn add_subscription(path: &Path) -> Result<()> {
+    let subs = load_subs(path).unwrap_or_default();
+    let new_id = subs.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+    println!("Автоматический ID: {}", new_id);
+
+    print!("URL подписки: ");
+    io::stdout().flush()?;
+    let mut url = String::new();
+    io::stdin().read_line(&mut url)?;
+    let url = url.trim().to_string();
+
+    let name = if let Ok(resp) = reqwest::blocking::get(&url) {
+        if let Ok(body) = resp.text() {
+            body.lines()
+                .find(|l| l.starts_with('#') && !l.starts_with("##"))
+                .map(|l| l.trim_start_matches('#').trim().to_string())
+                .or_else(|| {
+                    Url::parse(&url)
+                        .ok()
+                        .and_then(|u| u.path_segments()?.next_back().map(|s| s.to_string()))
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| {
+                    print!("Имя подписки: ");
+                    io::stdout().flush().ok();
+                    let mut name = String::new();
+                    io::stdin().read_line(&mut name).ok();
+                    name.trim().to_string()
+                })
+        } else {
+            print!("Имя подписки: ");
+            io::stdout().flush().ok();
+            let mut name = String::new();
+            io::stdin().read_line(&mut name).ok();
+            name.trim().to_string()
+        }
+    } else {
+        print!("Имя подписки: ");
+        io::stdout().flush().ok();
+        let mut name = String::new();
+        io::stdin().read_line(&mut name).ok();
+        name.trim().to_string()
+    };
+
+    let mut subs = subs;
+    subs.push(Subscription {
+        id: new_id,
+        name,
+        url,
+        enabled: true,
+    });
+    subs.sort_by_key(|s| s.id);
+    save_subs(path, &subs)?;
+    println!("✅ Подписка добавлена");
+    Ok(())
+}
+
+pub fn edit_subscription(path: &Path, id: usize) -> Result<()> {
+    let mut subs = load_subs(path)?;
+    let sub = subs
+        .iter_mut()
+        .find(|s| s.id == id)
+        .context("Подписка не найдена")?;
+    println!(
+        "Текущие данные: ID={}, Имя={}, URL={}",
+        sub.id, sub.name, sub.url
+    );
+    print!("Новое имя (Enter = оставить): ");
+    io::stdout().flush()?;
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    print!("Новый URL (Enter = оставить): ");
+    io::stdout().flush()?;
+    let mut url = String::new();
+    io::stdin().read_line(&mut url)?;
+    if !name.trim().is_empty() {
+        sub.name = name.trim().into();
+    }
+    if !url.trim().is_empty() {
+        sub.url = url.trim().into();
+    }
+    save_subs(path, &subs)?;
+    println!("✅ Подписка изменена");
+    Ok(())
+}
+
+pub fn remove_subscriptions(path: &Path, ids_spec: &str) -> Result<()> {
+    let mut subs = load_subs(path)?;
+    let ids = if ids_spec == "all" {
+        (1..=subs.len()).collect()
+    } else {
+        utils::expand_ids(ids_spec)?
+    };
+    let mut removed = 0;
+    subs.retain(|s| {
+        if ids.contains(&s.id) {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    for (i, s) in subs.iter_mut().enumerate() {
+        s.id = i + 1;
+    }
+    save_subs(path, &subs)?;
+    println!("✅ Удалено подписок: {}", removed);
+    Ok(())
+}
+
+pub fn switch_subscriptions(path: &Path, ids_spec: &str, enable: bool) -> Result<()> {
+    let mut subs = load_subs(path)?;
+    let ids = if ids_spec == "all" {
+        (1..=subs.len()).collect()
+    } else {
+        utils::expand_ids(ids_spec)?
+    };
+    for sub in subs.iter_mut() {
+        if ids.contains(&sub.id) {
+            sub.enabled = enable;
+        }
+    }
+    save_subs(path, &subs)?;
+    let action = if enable {
+        "включены"
+    } else {
+        "выключены"
+    };
+    println!("✅ Подписки {}: {}", action, ids_spec);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_save_and_load_subs() -> anyhow::Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path();
+        let subs = vec![
+            Subscription {
+                id: 1,
+                name: "Test".into(),
+                url: "https://test.com".into(),
+                enabled: true,
+            },
+            Subscription {
+                id: 2,
+                name: "Other".into(),
+                url: "vmess://example.com".into(),
+                enabled: false,
+            },
+        ];
+        save_subs(path, &subs)?;
+        let loaded = load_subs(path)?;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Test");
+        assert_eq!(loaded[1].enabled, false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_subs_empty_file() -> anyhow::Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path();
+        fs::write(path, "[]")?;
+        let subs = load_subs(path)?;
+        assert!(subs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_subs_missing_file() -> anyhow::Result<()> {
+        let path = std::path::Path::new("/tmp/non_existent_file_for_test.json");
+        let subs = load_subs(path)?;
+        assert!(subs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_subscriptions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("subs.json");
+        let subs = vec![
+            Subscription {
+                id: 1,
+                name: "s1".into(),
+                url: "u1".into(),
+                enabled: true,
+            },
+            Subscription {
+                id: 2,
+                name: "s2".into(),
+                url: "u2".into(),
+                enabled: true,
+            },
+        ];
+        save_subs(&path, &subs)?;
+        remove_subscriptions(&path, "1")?;
+        let remaining = load_subs(&path)?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, 1); // после удаления id пересчитываются, бывший 2 стал 1
+        Ok(())
+    }
+
+    #[test]
+    fn test_switch_subscriptions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("subs.json");
+        let subs = vec![Subscription {
+            id: 1,
+            name: "s1".into(),
+            url: "u1".into(),
+            enabled: true,
+        }];
+        save_subs(&path, &subs)?;
+        switch_subscriptions(&path, "1", false)?;
+        let loaded = load_subs(&path)?;
+        assert_eq!(loaded[0].enabled, false);
+        Ok(())
+    }
+}
+
+=== ./crates/vpn-subs/src/update.rs ===
+use anyhow::{bail, Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+use vpn_core::config::AppConfig;
+use vpn_core::http_tester::{HttpTester, TestConfig};
+use vpn_core::types::Subscription;
+use vpn_core::utils;
+
+pub fn update_single_sub(
+    sub: &Subscription,
+    proto: &str,
+    limit: usize,
+    _keep_raw: bool,
+    show_info: bool,
+    config: &AppConfig,
+    tester: &dyn HttpTester,
+) -> Result<Vec<PathBuf>> {
+    println!("ℹ️ Обновление [{}] {}", sub.id, sub.name);
+    let config_dir = dirs::config_dir()
+        .context("Не удалось определить config директорию")?
+        .join("vpn-manager");
+    std::fs::create_dir_all(&config_dir)?;
+
+    // Загрузка подписки (пока синхронно, можно будет заменить на асинхронную)
+    let raw_path = format!("/tmp/vpn-sub-{}-raw.txt", sub.id);
+    if sub.url.starts_with("http://") || sub.url.starts_with("https://") {
+        let client = reqwest::blocking::Client::new();
+        let resp = client.get(&sub.url).send()?;
+        if !resp.status().is_success() {
+            bail!("Ошибка загрузки подписки: HTTP {}", resp.status());
+        }
+        let body = resp.text()?;
+        fs::write(&raw_path, body)?;
+    } else if sub.url.starts_with("file://") {
+        fs::copy(sub.url.trim_start_matches("file://"), &raw_path)?;
+    } else if Path::new(&sub.url).exists() {
+        fs::copy(&sub.url, &raw_path)?;
+    } else {
+        bail!("Неизвестный источник: {}", sub.url);
+    }
+    let content = fs::read_to_string(&raw_path)?.replace('\r', "");
+    fs::write(&raw_path, content)?;
+
+    // Фильтрация
+    let filtered_path = format!("/tmp/vpn-sub-{}-filtered.txt", sub.id);
+    utils::filter_subscription_file(&raw_path, &filtered_path, proto, limit)?;
+
+    // HTTP тесты
+    let active_urls = utils::get_active_urls(config);
+    if active_urls.is_empty() {
+        bail!("Нет активных тестовых URL");
+    }
+
+    let test_config = TestConfig {
+        sub_id: sub.id,
+        timeout: config.http_test_timeout,
+        threads: config.http_test_threads,
+        insecure: config.insecure,
+        speedtest: config.speedtest,
+        show_info,
+        log_dir: PathBuf::from(&config.http_log_dir),
+        config,
+    };
+
+    let results = tester.run_tests(Path::new(&filtered_path), &active_urls, &test_config)?;
+
+    let live_files: Vec<PathBuf> = results
+        .into_iter()
+        .filter_map(|r| {
+            if r.success {
+                r.live_file_path
+            } else {
+                if let Some(err) = r.error {
+                    eprintln!("⚠️ Ошибка HTTP теста для {}: {}", r.url, err);
+                }
+                None
+            }
+        })
+        .collect();
+
+    if live_files.is_empty() {
+        bail!("Нет живых конфигов");
+    }
+
+    // Не удаляем временные файлы, если keep_raw? Но здесь мы уже возвращаем только live_files.
+    // keep_raw учитывается вызывающей стороной.
+    Ok(live_files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use vpn_core::http_tester::{HttpTester, LiveResult, TestConfig};
+    use vpn_core::types::Subscription;
+
+    struct MockHttpTester {
+        results: Vec<LiveResult>,
+    }
+
+    impl MockHttpTester {
+        fn new(results: Vec<LiveResult>) -> Self {
+            MockHttpTester { results }
+        }
+    }
+
+    impl HttpTester for MockHttpTester {
+        fn run_tests(
+            &self,
+            _config_file: &Path,
+            _urls: &[String],
+            _cfg: &TestConfig,
+        ) -> anyhow::Result<Vec<LiveResult>> {
+            Ok(self.results.clone())
+        }
+    }
+
+    /// Проверяем, что update_single_sub возвращает только успешные live_file_path
+    #[test]
+    fn test_update_single_sub_with_mock_tester() -> Result<()> {
+        // Создаём подписку с file://, чтобы избежать реальной сети
+        let dir = tempfile::tempdir()?;
+        let sub_file = dir.path().join("sub.txt");
+        std::fs::write(
+            &sub_file,
+            "vless://example.com:443\nvmess://example.com:100\n",
+        )?;
+
+        let sub = Subscription {
+            id: 1,
+            name: "test".into(),
+            url: format!("file://{}", sub_file.display()),
+            enabled: true,
+        };
+
+        let mut config = vpn_core::config::AppConfig::default();
+        config.http_log_dir = dir.path().to_string_lossy().to_string();
+
+        // Мок-тестер: первый URL успешен, второй неудачен
+        let live_path = dir.path().join("live1.txt");
+        std::fs::write(&live_path, "live config")?;
+        let mock = MockHttpTester::new(vec![
+            LiveResult {
+                url: "https://a.com".into(),
+                success: true,
+                live_file_path: Some(live_path.clone()),
+                error: None,
+            },
+            LiveResult {
+                url: "https://b.com".into(),
+                success: false,
+                live_file_path: None,
+                error: Some("timeout".into()),
+            },
+        ]);
+
+        let result = update_single_sub(&sub, "all", 0, false, false, &config, &mock)?;
+
+        // Должен вернуть только один успешный путь
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], live_path);
+
+        Ok(())
+    }
+}
+
+=== ./crates/vpn-subs/Cargo.toml ===
+[package]
+name = "vpn-subs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+reqwest = { version = "0.12", features = ["blocking", "socks"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "4.0"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3.3"
+=== ./crates/vpn-knife/Cargo.toml ===
+[package]
+name = "vpn-knife"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+=== ./crates/vpn-knife/src/lib.rs ===
+use anyhow::{bail, Context, Result};
+use std::path::Path;
+use std::process::{Child, Command};
+
+/// Загрузить подписку через xray-knife subs fetch
+pub fn fetch_subscription(url: &str, output: &Path) -> Result<()> {
+    let status = Command::new("xray-knife")
+        .args(["subs", "fetch", "-u", url, "-o", output.to_str().unwrap()])
+        .status()
+        .context("Не удалось запустить xray-knife subs fetch")?;
+    if !status.success() {
+        bail!(
+            "xray-knife subs fetch завершился с ошибкой (код {:?})",
+            status.code()
+        );
+    }
+    Ok(())
+}
+
+/// Запустить HTTP-тест одного URL и сохранить живые конфиги в `live_file`.
+/// Возвращает `true`, если файл с живыми конфигами был создан и не пуст.
+#[allow(clippy::too_many_arguments)]
+pub fn run_single_http_test(
+    config_file: &Path,
+    url: &str,
+    timeout: u64,
+    threads: usize,
+    insecure: bool,
+    speedtest: bool,
+    show_info: bool,
+    live_file: &Path,
+    log_file: &Path,
+) -> Result<bool> {
+    let mut cmd = Command::new("xray-knife");
+    cmd.arg("http")
+        .arg("-f")
+        .arg(config_file)
+        .arg("-d")
+        .arg(timeout.to_string())
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-u")
+        .arg(url)
+        .arg("-o")
+        .arg(live_file);
+    if insecure {
+        cmd.arg("-e");
+    }
+    if speedtest {
+        cmd.arg("--speedtest");
+    }
+
+    if show_info {
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        let status = cmd.status()?;
+        if !status.success() {
+            bail!("xray-knife http завершился с ошибкой");
+        }
+    } else {
+        let output = cmd.output()?;
+        if let Ok(mut f) = std::fs::File::create(log_file) {
+            use std::io::Write;
+            f.write_all(&output.stdout).ok();
+            f.write_all(&output.stderr).ok();
+        }
+    }
+
+    if live_file.exists() {
+        let meta = std::fs::metadata(live_file)?;
+        if meta.len() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Запустить прокси xray-knife и вернуть дочерний процесс.
+pub fn spawn_proxy(args: &[String], log_file: &Path) -> Result<Child> {
+    let log = std::fs::File::create(log_file)?;
+    Command::new("xray-knife")
+        .arg("proxy")
+        .args(args)
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .context("Не удалось запустить xray-knife proxy")
+}
+
+/// Запустить произвольную команду xray-knife (например, cfscanner) с аргументами.
+pub fn run_knife(cmd: &str, args: &[String]) -> Result<()> {
+    let mut child = Command::new("xray-knife")
+        .arg(cmd)
+        .args(args)
+        .spawn()
+        .context("Не удалось запустить xray-knife")?;
+    child.wait()?;
+    Ok(())
+}
+
+=== ./crates/vpn-testing/src/lib.rs ===
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+use vpn_core::http_tester::{HttpTester, LiveResult, TestConfig};
+// use vpn_knife;
+
+pub struct XrayKnifeHttpTester;
+
+impl HttpTester for XrayKnifeHttpTester {
+    fn run_tests(
+        &self,
+        config_file: &Path,
+        urls: &[String],
+        cfg: &TestConfig,
+    ) -> Result<Vec<LiveResult>> {
+        let mut handles = vec![];
+        let config_file = config_file.to_path_buf();
+
+        for url in urls {
+            let url = url.clone();
+            let cfg_file = config_file.clone();
+            let timeout = cfg.timeout;
+            let threads = cfg.threads;
+            let insecure = cfg.insecure;
+            let speedtest = cfg.speedtest;
+            let show_info = cfg.show_info;
+            let log_path = cfg.log_dir.join(format!(
+                "vpn-http-{}-{}.log",
+                cfg.sub_id,
+                sanitize_filename(&url)
+            ));
+            let sub_id = cfg.sub_id;
+
+            let live_file = tempfile::NamedTempFile::new()?.into_temp_path();
+            let live_path = live_file.to_path_buf();
+
+            let handle = std::thread::spawn(move || -> LiveResult {
+                let success = vpn_knife::run_single_http_test(
+                    &cfg_file, &url, timeout, threads, insecure, speedtest, show_info, &live_path,
+                    &log_path,
+                );
+
+                match success {
+                    Ok(true) => {
+                        let perm_path = PathBuf::from(format!(
+                            "/tmp/vpn-sub-{}-live-{}.txt",
+                            sub_id,
+                            sanitize_filename(&url)
+                        ));
+                        if let Err(e) = std::fs::rename(&live_path, &perm_path) {
+                            LiveResult {
+                                url,
+                                success: false,
+                                live_file_path: None,
+                                error: Some(format!("Ошибка перемещения файла: {}", e)),
+                            }
+                        } else {
+                            LiveResult {
+                                url,
+                                success: true,
+                                live_file_path: Some(perm_path),
+                                error: None,
+                            }
+                        }
+                    }
+                    Ok(false) => LiveResult {
+                        url,
+                        success: false,
+                        live_file_path: None,
+                        error: Some("Пустой результат теста".into()),
+                    },
+                    Err(e) => LiveResult {
+                        url,
+                        success: false,
+                        live_file_path: None,
+                        error: Some(e.to_string()),
+                    },
+                }
+            });
+            handles.push(handle);
+        }
+
+        let mut results = vec![];
+        for h in handles {
+            match h.join() {
+                Ok(res) => results.push(res),
+                Err(panic) => {
+                    results.push(LiveResult {
+                        url: "unknown".into(),
+                        success: false,
+                        live_file_path: None,
+                        error: Some(format!("Поток HTTP-теста упал: {:?}", panic)),
+                    });
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.replace(['/', ':', '?', '&'], "_")
+}
+
+=== ./crates/vpn-testing/Cargo.toml ===
+[package]
+name = "vpn-testing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+vpn-knife = { path = "../vpn-knife" }
+anyhow = "1.0"
+tempfile = "3.3"
+=== ./Cargo.toml ===
+[workspace]
+members = [
+    "crates/vpn-core",
+    "crates/vpn-subs",
+    "crates/vpn-knife",
+    "crates/vpn-testing",
+]
+
+[package]
+name = "vpn-manager"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "4.0"
+tempfile = "3.3"
+log = "0.4"
+env_logger = "0.10"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["blocking", "socks"] }
+libc = "0.2"
+base64 = "0.21"
+url = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+regex = "1"
+sha2 = "0.10"
+rand = "0.8"
+once_cell = "1"
+vpn-core = { path = "crates/vpn-core" }
+vpn-subs = { path = "crates/vpn-subs" }
+vpn-knife = { path = "crates/vpn-knife" }
+vpn-testing = { path = "crates/vpn-testing" }

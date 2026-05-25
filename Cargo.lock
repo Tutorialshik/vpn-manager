@@ -1720,6 +1720,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vpn-knife"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "vpn-manager"
 version = "1.0.0"
 dependencies = [
@@ -1742,7 +1749,9 @@ dependencies = [
  "tempfile",
  "url",
  "vpn-core",
+ "vpn-knife",
  "vpn-subs",
+ "vpn-testing",
 ]
 
 [[package]]
@@ -1757,6 +1766,16 @@ dependencies = [
  "tempfile",
  "url",
  "vpn-core",
+]
+
+[[package]]
+name = "vpn-testing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "vpn-core",
+ "vpn-knife",
 ]
 
 [[package]]

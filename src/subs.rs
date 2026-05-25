@@ -1,4 +1,3 @@
-use crate::knife;
 use crate::l10n;
 use crate::SubsCmd;
 use crate::SwitchCmd;
@@ -7,6 +6,8 @@ use std::path::Path;
 use vpn_core::config::AppConfig;
 use vpn_core::http_tester::HttpTester;
 use vpn_subs::crud;
+
+pub use vpn_subs::crud::list_subscriptions;
 
 pub fn handle_subs_ext(
     action: Option<SubsCmd>,
@@ -57,7 +58,7 @@ pub fn handle_subs_ext(
                 }
             }
             full_args.extend(args);
-            knife::run_knife("cfscanner", &full_args)
+            vpn_knife::run_knife("cfscanner", &full_args)
         }
     }
 }

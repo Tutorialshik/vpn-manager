@@ -1,8 +1,7 @@
-use crate::knife;
-use crate::l10n;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use vpn_core::http_tester::{HttpTester, LiveResult, TestConfig};
+// use vpn_knife;
 
 pub struct XrayKnifeHttpTester;
 
@@ -35,7 +34,7 @@ impl HttpTester for XrayKnifeHttpTester {
             let live_path = live_file.to_path_buf();
 
             let handle = std::thread::spawn(move || -> LiveResult {
-                let success = knife::run_single_http_test(
+                let success = vpn_knife::run_single_http_test(
                     &cfg_file, &url, timeout, threads, insecure, speedtest, show_info, &live_path,
                     &log_path,
                 );
@@ -52,10 +51,7 @@ impl HttpTester for XrayKnifeHttpTester {
                                 url,
                                 success: false,
                                 live_file_path: None,
-                                error: Some(l10n::t_fmt(
-                                    "http_tester.file_move_error",
-                                    &[&e.to_string()],
-                                )),
+                                error: Some(format!("Ошибка перемещения файла: {}", e)),
                             }
                         } else {
                             LiveResult {
@@ -70,7 +66,7 @@ impl HttpTester for XrayKnifeHttpTester {
                         url,
                         success: false,
                         live_file_path: None,
-                        error: Some(l10n::t("http_tester.empty_result")),
+                        error: Some("Пустой результат теста".into()),
                     },
                     Err(e) => LiveResult {
                         url,
@@ -92,10 +88,7 @@ impl HttpTester for XrayKnifeHttpTester {
                         url: "unknown".into(),
                         success: false,
                         live_file_path: None,
-                        error: Some(l10n::t_fmt(
-                            "http_tester.thread_panic",
-                            &[&format!("{:?}", panic)],
-                        )),
+                        error: Some(format!("Поток HTTP-теста упал: {:?}", panic)),
                     });
                 }
             }

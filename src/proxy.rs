@@ -1,5 +1,5 @@
-use crate::knife;
 use crate::l10n;
+use crate::subs;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -214,7 +214,7 @@ fn start_xray(
     args.push(config.blacklist_strikes.to_string());
 
     let log_file_path = config_dir.join("vpn-manager.log");
-    let mut child = knife::spawn_proxy(&args, &log_file_path)?;
+    let mut child = vpn_knife::spawn_proxy(&args, &log_file_path)?;
 
     let pid = child.id();
     std::thread::sleep(Duration::from_secs(1));
@@ -325,7 +325,7 @@ pub fn show_start_help(config: &AppConfig, subs_path: &Path) {
         println!("{}", l10n::t("proxy.config_dir_missing"));
     }
     println!("{}", l10n::t("proxy.subs_title"));
-    vpn_subs::crud::list_subscriptions(subs_path, config);
+    subs::list_subscriptions(subs_path, config);
     println!("{}", l10n::t("proxy.show_start_help_footer"));
 }
 

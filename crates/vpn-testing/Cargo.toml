@@ -1,0 +1,10 @@
+[package]
+name = "vpn-testing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+vpn-knife = { path = "../vpn-knife" }
+anyhow = "1.0"
+tempfile = "3.3"

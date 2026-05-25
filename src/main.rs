@@ -1,20 +1,17 @@
 mod commands;
 mod db;
 mod geo;
-mod http_tester;
-mod knife;
 mod l10n;
 mod proxy;
 mod settings;
 mod subs;
 mod update;
 
-// use crate::l10n;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use http_tester::XrayKnifeHttpTester;
 use std::path::{Path, PathBuf};
 use vpn_core::config::AppConfig;
+use vpn_testing::XrayKnifeHttpTester;
 
 #[derive(Parser)]
 #[command(
@@ -273,7 +270,7 @@ fn main() -> Result<()> {
                     )?;
                 }
                 StartTarget::Exec { args } => {
-                    knife::run_knife("exec", &args)?;
+                    vpn_knife::run_knife("exec", &args)?;
                 }
             }
         }
@@ -428,6 +425,6 @@ fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>)
         );
     }
 
-    vpn_subs::crud::list_subscriptions(subs_path, app);
+    subs::list_subscriptions(subs_path, app);
     Ok(())
 }
