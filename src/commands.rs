@@ -1,9 +1,9 @@
-use crate::l10n;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use vpn_l10n as l10n;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]

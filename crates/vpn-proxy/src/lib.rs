@@ -1,13 +1,12 @@
-use crate::l10n;
-use crate::subs;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use vpn_core::config::AppConfig;
-use vpn_core::types::ConfigInfo;
+use vpn_core::types::{ChangeCmd, ConfigInfo};
 use vpn_core::utils;
+// use vpn_knife;
 
 pub fn is_running(_config: &AppConfig) -> bool {
     match pid_file_path() {
@@ -28,7 +27,7 @@ pub fn is_running(_config: &AppConfig) -> bool {
 
 fn pid_file_path() -> Result<PathBuf> {
     let dir = dirs::config_dir()
-        .context(l10n::t("proxy.config_dir_missing"))?
+        .context("Не удалось определить config директорию")?
         .join("vpn-manager");
     Ok(dir.join("xray-knife.pid"))
 }
@@ -39,9 +38,9 @@ pub fn stop_proxy(_config: &AppConfig) -> Result<()> {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             if unsafe { libc::kill(pid, 0) } == 0 {
                 unsafe { libc::kill(pid, 15) };
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::thread::sleep(Duration::from_secs(1));
                 let _ = unsafe { libc::kill(pid, 9) };
-                println!("{}", l10n::t_fmt("proxy.stopped", &[&pid.to_string()]));
+                println!("✅ Прокси остановлен (PID {})", pid);
             }
         }
         let _ = fs::remove_file(&pid_path);
@@ -62,7 +61,7 @@ pub fn handle_start(
 ) -> Result<()> {
     stop_proxy(config)?;
     let config_dir = dirs::config_dir()
-        .context(l10n::t("proxy.config_dir_missing"))?
+        .context("Не удалось определить config директорию")?
         .join("vpn-manager");
 
     let (cfg_file, save_region) = match target {
@@ -71,7 +70,7 @@ pub fn handle_start(
                 let id = &config.last_region[5..];
                 let live = config_dir.join(format!("sub_{}_live.txt", id));
                 if !live.exists() {
-                    bail!(l10n::t_fmt("proxy.update_before_start", &[id]));
+                    bail!("Сначала обновите подписку {}", id);
                 }
                 (live, config.last_region.clone())
             } else {
@@ -79,7 +78,7 @@ pub fn handle_start(
                     utils::resolve_region(&config.last_region).unwrap_or_else(|| "eu".into());
                 let file = config_dir.join("lists").join(format!("{}.txt", region));
                 if !file.exists() {
-                    bail!(l10n::t_fmt("proxy.region_file_not_found", &[&region]));
+                    bail!("Файл региона {} не найден", region);
                 }
                 (file, region)
             }
@@ -88,7 +87,7 @@ pub fn handle_start(
             let r = utils::resolve_region(region).unwrap();
             let file = config_dir.join("lists").join(format!("{}.txt", r));
             if !file.exists() || fs::metadata(&file)?.len() == 0 {
-                bail!(l10n::t_fmt("proxy.region_file_not_found_or_empty", &[&r]));
+                bail!("Файл региона {} не найден или пуст", r);
             }
             (file, r)
         }
@@ -98,11 +97,11 @@ pub fn handle_start(
                 let id: usize = parts[1].parse()?;
                 let live = config_dir.join(format!("sub_{}_live.txt", id));
                 if !live.exists() {
-                    bail!(l10n::t_fmt("proxy.update_before_start", &[&id.to_string()]));
+                    bail!("Сначала update {}", id);
                 }
                 (live, format!("_sub_{}", id))
             } else {
-                bail!(l10n::t_fmt("proxy.unknown_target", &[target]));
+                bail!("Неизвестная цель: {}", target);
             }
         }
     };
@@ -113,16 +112,12 @@ pub fn handle_start(
     Ok(())
 }
 
-pub fn change_profile(
-    action: crate::ChangeCmd,
-    config: &AppConfig,
-    _subs_path: &Path,
-) -> Result<()> {
+pub fn change_profile(action: ChangeCmd, config: &AppConfig, _subs_path: &Path) -> Result<()> {
     if !is_running(config) {
-        bail!(l10n::t("proxy.not_running"));
+        bail!("Прокси не запущен. Сначала выполните start.");
     }
     let config_dir = dirs::config_dir()
-        .context(l10n::t("proxy.config_dir_missing"))?
+        .context("Не удалось определить config директорию")?
         .join("vpn-manager");
 
     let current_cfg = if config.last_region.starts_with("_sub_") {
@@ -133,10 +128,7 @@ pub fn change_profile(
         config_dir.join("lists").join(format!("{}.txt", region))
     };
     if !current_cfg.exists() {
-        bail!(l10n::t_fmt(
-            "proxy.config_not_found",
-            &[&current_cfg.display().to_string()]
-        ));
+        bail!("Файл конфигов не найден: {}", current_cfg.display());
     }
 
     let profiles: Vec<String> = fs::read_to_string(&current_cfg)?
@@ -145,7 +137,7 @@ pub fn change_profile(
         .collect();
 
     if profiles.is_empty() {
-        bail!(l10n::t("proxy.profile_list_empty"));
+        bail!("Список профилей пуст");
     }
 
     let selected = match action {
@@ -176,7 +168,7 @@ pub fn change_profile(
     fs::write(tmp_file.path(), &selected)?;
     stop_proxy(config)?;
     start_xray(tmp_file.path(), &[], config, &config_dir)?;
-    println!("{}", l10n::t("proxy.changed"));
+    println!("✅ Профиль изменён");
     Ok(())
 }
 
@@ -220,19 +212,17 @@ fn start_xray(
     std::thread::sleep(Duration::from_secs(1));
     match child.try_wait() {
         Ok(Some(status)) => {
-            bail!(l10n::t_fmt(
-                "proxy.process_died",
-                &[
-                    &status.code().unwrap_or(1).to_string(),
-                    &log_file_path.display().to_string()
-                ]
-            ));
+            bail!(
+                "Процесс xray-knife proxy неожиданно завершился (код {:?}). Проверьте лог: {}",
+                status.code(),
+                log_file_path.display()
+            );
         }
         Ok(None) => {
             fs::write(pid_file_path()?, pid.to_string())?;
         }
         Err(e) => {
-            bail!(l10n::t_fmt("proxy.process_check_error", &[&e.to_string()]));
+            bail!("Ошибка при проверке процесса: {}", e);
         }
     }
 
@@ -241,92 +231,26 @@ fn start_xray(
     } else {
         &format!("inbound ({})", config.last_inbound_proto)
     };
-    println!("{}", l10n::t("proxy.started"));
+    println!("═══════════════════ Прокси запущен ═══════════════════");
+    println!(" Файл: {} (ядро: {})", cfg_file.display(), config.core);
+    println!(" Адрес: {}:{}", config.listen_ip, config.default_port);
+    println!(" Режим: {}", mode_str);
     println!(
-        "{}",
-        l10n::t_fmt(
-            "proxy.file",
-            &[&cfg_file.display().to_string(), &config.core]
-        )
+        " Ротация: каждые {}с, блэклист: {}/{}с",
+        config.rotate, config.blacklist_strikes, config.blacklist_duration
     );
-    println!(
-        "{}",
-        l10n::t_fmt(
-            "proxy.address",
-            &[&config.listen_ip, &config.default_port.to_string()]
-        )
-    );
-    println!("{}", l10n::t_fmt("proxy.mode", &[mode_str]));
-    println!(
-        "{}",
-        l10n::t_fmt(
-            "proxy.rotation",
-            &[
-                &config.rotate.to_string(),
-                &config.blacklist_strikes.to_string(),
-                &config.blacklist_duration.to_string()
-            ]
-        )
-    );
-    println!(
-        "{}",
-        l10n::t_fmt("proxy.extra_flags", &[&format!("{:?}", extra_args)])
-    );
+    println!(" Доп. флаги: {:?}", extra_args);
 
     if let Some(info) = get_config_info_from_file(cfg_file, config) {
         println!(
-            "{}",
-            l10n::t_fmt(
-                "proxy.server",
-                &[
-                    &info.flag,
-                    &info.country,
-                    &info.host,
-                    &info.ip,
-                    &info.protocol
-                ]
-            )
+            " Сервер: {} {} ({} / {}) протокол: {}",
+            info.flag, info.country, info.host, info.ip, info.protocol
         );
     }
 
-    println!("{}", l10n::t_fmt("proxy.pid", &[&pid.to_string()]));
+    println!(" PID: {}", pid);
     println!("══════════════════════════════════════════════════════");
     Ok(())
-}
-
-pub fn show_start_help(config: &AppConfig, subs_path: &Path) {
-    println!("{}", l10n::t("proxy.show_start_help_title"));
-    println!("{}", l10n::t("proxy.show_start_help_line1"));
-    println!("{}", l10n::t("proxy.show_start_help_line2"));
-    println!("{}", l10n::t("proxy.show_start_help_line3"));
-    println!("{}", l10n::t("proxy.show_start_help_line4"));
-    println!("{}", l10n::t("proxy.show_start_help_line5"));
-    println!("{}", l10n::t("proxy.show_start_help_flags1"));
-    println!("{}", l10n::t("proxy.show_start_help_flags2"));
-    println!("{}", l10n::t("proxy.show_start_help_flags3"));
-    println!("{}", l10n::t("proxy.regions"));
-    if let Some(config_dir) = dirs::config_dir() {
-        let lists_dir = config_dir.join("vpn-manager").join("lists");
-        for region in &["ru", "us", "eu", "de", "pl", "fi", "nl", "other"] {
-            let file = lists_dir.join(format!("{}.txt", region));
-            let count = if file.exists() {
-                fs::read_to_string(&file)
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            println!(
-                "{}",
-                l10n::t_fmt("proxy.live_count", &[region, &count.to_string()])
-            );
-        }
-    } else {
-        println!("{}", l10n::t("proxy.config_dir_missing"));
-    }
-    println!("{}", l10n::t("proxy.subs_title"));
-    subs::list_subscriptions(subs_path, config);
-    println!("{}", l10n::t("proxy.show_start_help_footer"));
 }
 
 pub fn get_current_config_info(config: &AppConfig) -> Option<ConfigInfo> {
@@ -355,7 +279,7 @@ fn get_config_info_from_file(cfg_file: &Path, config: &AppConfig) -> Option<Conf
         return None;
     }
     let ip = utils::resolve_ip(&host)?;
-    let code = crate::geo::country_code(&ip, &config.geoip_db);
+    let code = vpn_core::geo::country_code(&ip, &config.geoip_db);
     let country = code.clone().unwrap_or_else(|| "??".into());
     let flag = match code.as_deref() {
         Some("RU") => "🇷🇺",

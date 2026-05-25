@@ -4,6 +4,8 @@ members = [
     "crates/vpn-subs",
     "crates/vpn-knife",
     "crates/vpn-testing",
+    "crates/vpn-proxy",
+    "crates/vpn-l10n",
 ]
 
 [package]
@@ -34,3 +36,5 @@ vpn-core = { path = "crates/vpn-core" }
 vpn-subs = { path = "crates/vpn-subs" }
 vpn-knife = { path = "crates/vpn-knife" }
 vpn-testing = { path = "crates/vpn-testing" }
+vpn-proxy = { path = "crates/vpn-proxy" }
+vpn-l10n = { path = "crates/vpn-l10n" }

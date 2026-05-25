@@ -7,6 +7,7 @@ use url::Url;
 use vpn_core::config::AppConfig;
 use vpn_core::types::{Subscription, Subscriptions};
 use vpn_core::utils;
+use vpn_l10n as l10n;
 
 pub fn load_subs(path: &Path) -> Result<Subscriptions> {
     if path.exists() {
@@ -121,50 +122,49 @@ pub fn list_subscriptions(path: &Path, config: &AppConfig) {
 }
 
 pub fn add_subscription(path: &Path) -> Result<()> {
-    let subs = load_subs(path).unwrap_or_default();
+    let mut subs = load_subs(path).unwrap_or_default();
     let new_id = subs.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-    println!("Автоматический ID: {}", new_id);
+    println!("{}", l10n::t_fmt("subs.auto_id", &[&new_id.to_string()]));
 
-    print!("URL подписки: ");
+    print!("{}", l10n::t("subs.enter_url"));
     io::stdout().flush()?;
-    let mut url = String::new();
-    io::stdin().read_line(&mut url)?;
-    let url = url.trim().to_string();
+    let mut url_buf = String::new();
+    io::stdin().read_line(&mut url_buf)?;
+    let url = url_buf.trim().to_string();
 
-    let name = if let Ok(resp) = reqwest::blocking::get(&url) {
-        if let Ok(body) = resp.text() {
-            body.lines()
-                .find(|l| l.starts_with('#') && !l.starts_with("##"))
-                .map(|l| l.trim_start_matches('#').trim().to_string())
-                .or_else(|| {
-                    Url::parse(&url)
-                        .ok()
-                        .and_then(|u| u.path_segments()?.next_back().map(|s| s.to_string()))
-                        .filter(|s| !s.is_empty())
-                })
-                .unwrap_or_else(|| {
-                    print!("Имя подписки: ");
-                    io::stdout().flush().ok();
-                    let mut name = String::new();
-                    io::stdin().read_line(&mut name).ok();
-                    name.trim().to_string()
-                })
+    let name = {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok();
+        let mut name_from_web = None;
+        if let Some(client) = client {
+            if let Ok(resp) = client.get(&url).send() {
+                if let Ok(body) = resp.text() {
+                    name_from_web = body
+                        .lines()
+                        .find(|l| l.starts_with('#') && !l.starts_with("##"))
+                        .map(|l| l.trim_start_matches('#').trim().to_string());
+                    if name_from_web.is_none() {
+                        name_from_web = Url::parse(&url)
+                            .ok()
+                            .and_then(|u| u.path_segments()?.next_back().map(|s| s.to_string()))
+                            .filter(|s| !s.is_empty());
+                    }
+                }
+            }
+        }
+        if let Some(name) = name_from_web {
+            name
         } else {
-            print!("Имя подписки: ");
+            print!("{}", l10n::t("subs.enter_name"));
             io::stdout().flush().ok();
             let mut name = String::new();
             io::stdin().read_line(&mut name).ok();
             name.trim().to_string()
         }
-    } else {
-        print!("Имя подписки: ");
-        io::stdout().flush().ok();
-        let mut name = String::new();
-        io::stdin().read_line(&mut name).ok();
-        name.trim().to_string()
     };
 
-    let mut subs = subs;
     subs.push(Subscription {
         id: new_id,
         name,
@@ -173,7 +173,7 @@ pub fn add_subscription(path: &Path) -> Result<()> {
     });
     subs.sort_by_key(|s| s.id);
     save_subs(path, &subs)?;
-    println!("✅ Подписка добавлена");
+    println!("{}", l10n::t("subs.added"));
     Ok(())
 }
 

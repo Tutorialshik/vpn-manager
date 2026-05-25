@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::path::Path;
 
 /// Открыть или создать БД и включить WAL
@@ -32,33 +32,4 @@ fn create_tables(conn: &Connection) -> Result<()> {
         );",
     )?;
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn cache_host_country(conn: &Connection, host: &str, country: &str) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    conn.execute(
-        "INSERT OR REPLACE INTO host_country_cache (host, country, updated_at) VALUES (?1, ?2, ?3)",
-        params![host, country, now],
-    )?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub fn get_cached_country(conn: &Connection, host: &str, ttl: u64) -> Option<String> {
-    let now = chrono::Utc::now().timestamp();
-    let mut stmt = conn
-        .prepare("SELECT country, updated_at FROM host_country_cache WHERE host = ?1")
-        .ok()?;
-    let row = stmt
-        .query_row(params![host], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .ok()?;
-    let (country, updated_at) = row;
-    if (now - updated_at) < ttl as i64 {
-        Some(country)
-    } else {
-        None
-    }
 }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 vpn-core = { path = "../vpn-core" }
+vpn-l10n = { path = "../vpn-l10n" }
 reqwest = { version = "0.12", features = ["blocking", "socks"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }

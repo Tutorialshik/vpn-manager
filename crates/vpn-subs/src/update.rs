@@ -24,7 +24,10 @@ pub fn update_single_sub(
     // Загрузка подписки (пока синхронно, можно будет заменить на асинхронную)
     let raw_path = format!("/tmp/vpn-sub-{}-raw.txt", sub.id);
     if sub.url.starts_with("http://") || sub.url.starts_with("https://") {
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(config.http_test_timeout))
+            .build()
+            .context("Не удалось создать HTTP-клиент")?;
         let resp = client.get(&sub.url).send()?;
         if !resp.status().is_success() {
             bail!("Ошибка загрузки подписки: HTTP {}", resp.status());

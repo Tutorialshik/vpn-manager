@@ -1,0 +1,13 @@
+[package]
+name = "vpn-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+vpn-knife = { path = "../vpn-knife" }
+anyhow = "1.0"
+libc = "0.2"
+rand = "0.8"
+tempfile = "3.3"
+dirs = "4.0"

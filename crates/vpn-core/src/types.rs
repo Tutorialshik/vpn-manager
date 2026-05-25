@@ -35,3 +35,11 @@ pub struct ParallelRule {
     #[serde(default)]
     pub allow_fallback: bool,
 }
+
+#[derive(Debug, Clone, Copy, clap::Subcommand)]
+pub enum ChangeCmd {
+    Next,
+    Prev,
+    Random,
+    Fastest,
+}

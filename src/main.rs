@@ -1,9 +1,7 @@
 mod commands;
 mod db;
-mod geo;
-mod l10n;
-mod proxy;
 mod settings;
+mod start_help;
 mod subs;
 mod update;
 
@@ -11,6 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use vpn_core::config::AppConfig;
+use vpn_core::types::ChangeCmd;
+use vpn_l10n as l10n;
 use vpn_testing::XrayKnifeHttpTester;
 
 #[derive(Parser)]
@@ -34,7 +34,6 @@ enum Commands {
         #[arg(short = 'r', long = "rotate")]
         rotate: Option<u64>,
 
-        /// Цель и дополнительные аргументы (menu, now, region <регион>, sub <ID>, exec <команда...>)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -59,14 +58,6 @@ enum Commands {
     },
     #[command(about = "Показать состояние")]
     Status,
-}
-
-#[derive(Subcommand, Clone)]
-pub enum ChangeCmd {
-    Next,
-    Prev,
-    Random,
-    Fastest,
 }
 
 #[derive(Subcommand, Clone)]
@@ -211,7 +202,13 @@ fn main() -> Result<()> {
     let cmd_help = commands::load_commands(&commands_path).ok();
 
     let db_path = PathBuf::from(&app_config.parallel_db_path);
-    let db = db::open_db(&db_path).ok();
+    let db = match db::open_db(&db_path) {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            eprintln!("⚠️ Предупреждение: не удалось открыть БД статистики ({}). Функционал статистики будет недоступен.", e);
+            None
+        }
+    };
 
     match cli.command {
         Some(Commands::Start {
@@ -219,15 +216,11 @@ fn main() -> Result<()> {
             rotate,
             extra_args,
         }) => {
-            let target = if extra_args.is_empty() {
+            let mut proxy_args: Vec<String> = extra_args.clone();
+            let target = if proxy_args.is_empty() {
                 "menu".to_string()
             } else {
-                extra_args[0].clone()
-            };
-            let mut proxy_args: Vec<String> = if extra_args.len() > 1 {
-                extra_args[1..].to_vec()
-            } else {
-                vec![]
+                proxy_args.remove(0)
             };
 
             if let Some(m) = method {
@@ -239,11 +232,11 @@ fn main() -> Result<()> {
                 proxy_args.push(r.to_string());
             }
 
-            let target_parsed = parse_start_target(&target, &mut proxy_args)?;
-            match target_parsed {
-                StartTarget::Menu => proxy::show_start_help(&app_config, &subs_path),
-                StartTarget::Now => {
-                    proxy::handle_start(
+            // Здесь обрабатываем цель
+            match target.as_str() {
+                "menu" | "" => start_help::show_start_help(&app_config, &subs_path),
+                "now" => {
+                    vpn_proxy::handle_start(
                         "now",
                         &proxy_args,
                         &mut app_config,
@@ -251,8 +244,12 @@ fn main() -> Result<()> {
                         &subs_path,
                     )?;
                 }
-                StartTarget::Region { region } => {
-                    proxy::handle_start(
+                "region" => {
+                    if proxy_args.is_empty() {
+                        anyhow::bail!("Укажите регион после 'region'");
+                    }
+                    let region = proxy_args.remove(0);
+                    vpn_proxy::handle_start(
                         &region,
                         &proxy_args,
                         &mut app_config,
@@ -260,8 +257,12 @@ fn main() -> Result<()> {
                         &subs_path,
                     )?;
                 }
-                StartTarget::Sub { id } => {
-                    proxy::handle_start(
+                "sub" => {
+                    if proxy_args.is_empty() {
+                        anyhow::bail!("Укажите ID подписки после 'sub'");
+                    }
+                    let id: usize = proxy_args.remove(0).parse()?;
+                    vpn_proxy::handle_start(
                         &format!("sub {}", id),
                         &proxy_args,
                         &mut app_config,
@@ -269,23 +270,38 @@ fn main() -> Result<()> {
                         &subs_path,
                     )?;
                 }
-                StartTarget::Exec { args } => {
+                "exec" => {
+                    let args = proxy_args;
                     vpn_knife::run_knife("exec", &args)?;
+                }
+                other => {
+                    // Возможно, регион без префикса
+                    if vpn_core::utils::resolve_region(other).is_some() {
+                        vpn_proxy::handle_start(
+                            other,
+                            &proxy_args,
+                            &mut app_config,
+                            &config_path,
+                            &subs_path,
+                        )?;
+                    } else {
+                        anyhow::bail!(l10n::t_fmt("proxy.unknown_target", &[other]));
+                    }
                 }
             }
         }
-        Some(Commands::Stop) => proxy::stop_proxy(&app_config)?,
+        Some(Commands::Stop) => vpn_proxy::stop_proxy(&app_config)?,
         Some(Commands::Restart) => {
-            proxy::stop_proxy(&app_config)?;
-            proxy::handle_start("now", &[], &mut app_config, &config_path, &subs_path)?;
+            vpn_proxy::stop_proxy(&app_config)?;
+            vpn_proxy::handle_start("now", &[], &mut app_config, &config_path, &subs_path)?;
         }
         Some(Commands::Change { action }) => {
             let action = action.unwrap_or(ChangeCmd::Next);
-            proxy::change_profile(action, &app_config, &subs_path)?;
+            vpn_proxy::change_profile(action, &app_config, &subs_path)?;
         }
         Some(Commands::Subs { action }) => {
             let tester = XrayKnifeHttpTester;
-            subs::handle_subs_ext(action, &subs_path, &app_config, db.as_ref(), &tester)?;
+            crate::subs::handle_subs_ext(action, &subs_path, &app_config, db.as_ref(), &tester)?;
         }
         Some(Commands::Settings { setting }) => {
             settings::handle_settings(setting, &mut app_config, &config_path, &subs_path)?;
@@ -305,57 +321,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-enum StartTarget {
-    Menu,
-    Now,
-    Region { region: String },
-    Sub { id: usize },
-    Exec { args: Vec<String> },
-}
-
-fn parse_start_target(target: &str, proxy_args: &mut Vec<String>) -> Result<StartTarget> {
-    let trimmed = target.trim();
-    if trimmed.is_empty() || trimmed == "menu" {
-        Ok(StartTarget::Menu)
-    } else if trimmed == "now" {
-        Ok(StartTarget::Now)
-    } else if trimmed == "region" {
-        if proxy_args.is_empty() {
-            Err(anyhow::anyhow!(l10n::t_fmt(
-                "proxy.unknown_target",
-                &[target]
-            )))
-        } else {
-            let region = proxy_args.remove(0);
-            Ok(StartTarget::Region { region })
-        }
-    } else if trimmed == "sub" {
-        if proxy_args.is_empty() {
-            Err(anyhow::anyhow!(l10n::t_fmt(
-                "proxy.unknown_target",
-                &[target]
-            )))
-        } else {
-            let id: usize = proxy_args.remove(0).parse()?;
-            Ok(StartTarget::Sub { id })
-        }
-    } else if trimmed == "exec" {
-        let args = std::mem::take(proxy_args);
-        Ok(StartTarget::Exec { args })
-    } else if vpn_core::utils::resolve_region(trimmed).is_some() {
-        Ok(StartTarget::Region {
-            region: trimmed.to_owned(),
-        })
-    } else {
-        Err(anyhow::anyhow!(l10n::t_fmt(
-            "proxy.unknown_target",
-            &[target]
-        )))
-    }
-}
-
 fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>) -> Result<()> {
-    let running = proxy::is_running(app);
+    let running = vpn_proxy::is_running(app);
     let (status_text, color) = if running {
         (l10n::t("status.running"), "\x1b[32m")
     } else {
@@ -414,7 +381,7 @@ fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>)
         l10n::t_fmt("status.proxy_running", &[color, &status_text])
     );
 
-    if let Some(info) = proxy::get_current_config_info(app) {
+    if let Some(info) = vpn_proxy::get_current_config_info(app) {
         println!(
             "{}",
             l10n::t_fmt("status.server", &[&info.flag, &info.country, &info.host])
@@ -425,6 +392,6 @@ fn status(app: &AppConfig, subs_path: &Path, _db: Option<&rusqlite::Connection>)
         );
     }
 
-    subs::list_subscriptions(subs_path, app);
+    vpn_subs::crud::list_subscriptions(subs_path, app);
     Ok(())
 }
