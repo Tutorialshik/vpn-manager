@@ -75,8 +75,4 @@ vpn-manager start --rules parallel_rules.json
 
 ## Участие в разработке
 
-Если вы хотите оптимизировать алгоритмы выбора профилей, предложить идеи для правил маршрутизации или помочь с разработкой GUI — создайте [Issue](https://www.google.com/search?q=https://github.com/your-username/failover/issues) или отправьте Pull Request.
-
-## Лицензия
-
-Проект распространяется под лицензией [MIT](https://www.google.com/search?q=LICENSE).
+Если вы хотите оптимизировать алгоритмы выбора профилей, предложить идеи для правил маршрутизации или помочь с разработкой GUI — создайте [Issue](https://github.com/Tutorialshik/Failover/issues) или отправьте Pull Request.
